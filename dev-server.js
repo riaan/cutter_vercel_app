@@ -1,5 +1,5 @@
 // Tiny static server for local testing — no dependencies.
-// Run: node dev-server.js   then open http://localhost:3000
+// Run: node dev-server.js   then open http://localhost:3000 and test
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
