@@ -1,8 +1,10 @@
-import { ShapeEditor } from './editor.js';
+import { ShapeEditor, flatten, mapPts } from './editor.js';
 import { CutterViewer } from './viewer.js';
 import { importSVG } from './svgimport.js';
 import { PRESETS } from './presets.js';
-import { buildCutter, toBinarySTL, offsetPolygon, cleanPolygon, bounds, bridgeShapes, loadManifold, manifoldReady, DEFAULT_PARAMS } from './geometry.js';
+import { packProject, unpackProject, PROJECT_EXT } from './project.js';
+import { buildCutter, toBinarySTL, offsetPolygon, cleanPolygon, bounds, bridgeShapes, signedArea,
+         unionPolygons, loadManifold, manifoldReady, DEFAULT_PARAMS } from './geometry.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -39,6 +41,8 @@ function onShapeChange(shape) {
   $('secInnerWrap').hidden = shape.inner.length < 3;
   syncWallActions();
   autoBridgeWidth(shape);
+  setSaveEnabled(hasOuter);
+  $('resultBtn').disabled = !hasOuter;
   scheduleRegen();
 }
 
@@ -131,6 +135,7 @@ function regenerate() {
     $('statTris').textContent = `${(cm3 * 1.24).toFixed(1)} g`;
     $('stats').title = `${cm3.toFixed(1)} cm³ · ${result.triangles.toLocaleString()} triangles`;
     setReady('Watertight · ready');
+    checkAgainstSaved();
   } catch (e) {
     result = null; viewer.clearMesh(); setDownloadEnabled(false);
     err.textContent = e.message || 'Could not build the cutter.'; err.hidden = false;
@@ -158,6 +163,121 @@ $('downloadBtnMobile').addEventListener('click', download);
 
 // A fresh name on every page load, e.g. cutter-k7x2q
 $('fileName').value = `cutter-${Math.random().toString(36).slice(2, 7)}`;
+
+// ---------- project files (.cutter) ----------
+// Saving writes the drawing and every setting, so opening the file later rebuilds the very
+// same cutter. The STL and the two pictures ride along for convenience; only the settings
+// are read back.
+function fileBaseName() { return ($('fileName').value || 'cutter').trim().replace(/[^\w\-]+/g, '-') || 'cutter'; }
+
+function currentState() {
+  return {
+    ...editor.getState(),
+    params: { ...params },
+    bridgeAuto,
+    name: fileBaseName(),
+    stats: result ? { width: result.footprint.width, height: result.footprint.height, height3d: result.footprint.height3d } : null,
+  };
+}
+
+function setSaveEnabled(on) { $('saveProjectBtn').disabled = !on; $('saveProjectBtn2').disabled = !on; }
+
+function saveProject() {
+  const name = fileBaseName();
+  const files = {};
+  if (result) {
+    try { files.stl = toBinarySTL(result.positions, name); } catch { /* the STL is a bonus, not the project */ }
+    files.png3d = viewer.snapshot(1000, 750) || undefined;
+  }
+  try { files.png2d = pngBytes(editor.renderPreview(1000, 1000)); } catch { /* same */ }
+  const bytes = packProject(currentState(), files);
+  saveBlob(new Blob([bytes], { type: 'application/zip' }), name + PROJECT_EXT);
+  toast(`Saved ${name}${PROJECT_EXT} — open it later to carry on with the same shape and settings.`);
+}
+
+// A canvas as raw PNG bytes (toDataURL is synchronous, which keeps saving one clean step).
+function pngBytes(canvas) {
+  const url = canvas.toDataURL('image/png');
+  const bin = atob(url.slice(url.indexOf(',') + 1));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function openProject(file) {
+  let state;
+  try {
+    state = await unpackProject(await file.arrayBuffer());
+  } catch (e) {
+    toast(e.message || 'Could not open that project file.');
+    return;
+  }
+  if (editor.hasOuter) {
+    const ok = await confirmAction('Open this project?',
+      'What is on the canvas now is replaced by the saved drawing and its settings. This cannot be undone.', 'Open');
+    if (!ok) return;
+  }
+  applyState(state);
+  toast(`Opened ${file.name} — shape and settings restored.`);
+}
+
+// Order matters: symmetry and the seeds go in together, then the settings the 3D build reads.
+function applyState(state) {
+  editor.setState(state);
+
+  Object.assign(params, state.params);
+  bridgeAuto = state.bridgeAuto;
+  $('bridgeAutoBtn').setAttribute('aria-pressed', String(bridgeAuto));
+  syncParamInputs();
+
+  $('fileName').value = state.name || 'cutter';
+  $('symXBtn').setAttribute('aria-pressed', String(state.sym.x));
+  $('symYBtn').setAttribute('aria-pressed', String(state.sym.y));
+  $('gridSize').value = String(state.grid.size);
+  $('snapBtn').setAttribute('aria-pressed', String(state.grid.snap));
+  $('smoothing').value = String(state.smoothing);
+  $('smoothingVal').textContent = state.smoothing.toFixed(2);
+  $('lockBtn').setAttribute('aria-pressed', String(editor.lockAspect));
+
+  setTool(editor.tool);
+  setActive(editor.active);
+  ringsKey = '';
+  onParamsChanged();
+  refreshSummaries();
+  editor.requestRender();
+
+  // A saved size that no longer builds the same would mean the geometry changed under the
+  // file; say so quietly rather than pretending everything matched.
+  if (state.stats) {
+    pendingCheck = state.stats;
+  }
+}
+
+let pendingCheck = null;
+function checkAgainstSaved() {
+  if (!pendingCheck || !result) return;
+  const saved = pendingCheck; pendingCheck = null;
+  const off = Math.max(Math.abs(saved.width - result.footprint.width), Math.abs(saved.height - result.footprint.height));
+  if (off > 0.05) toast('Opened, but this cutter comes out slightly different from when it was saved.');
+}
+
+$('saveProjectBtn').addEventListener('click', saveProject);
+$('saveProjectBtn2').addEventListener('click', saveProject);
+const pickProject = () => $('projectInput').click();
+$('openProjectBtn').addEventListener('click', pickProject);
+$('openProjectBtn2').addEventListener('click', pickProject);
+$('projectInput').addEventListener('change', (e) => {
+  const file = e.target.files?.[0]; e.target.value = '';
+  if (file) openProject(file);
+});
+setSaveEnabled(false);
 
 // ---------- tools ----------
 const TOOL_TIPS = {
@@ -311,6 +431,8 @@ $('guideVBtn').addEventListener('click', () => { editor.addGuide('v'); toast('Gu
 $('guideHBtn').addEventListener('click', () => { editor.addGuide('h'); toast('Guide added — drag its tab at the left edge, double-tap it to remove.'); });
 $('guideClearBtn').addEventListener('click', () => editor.clearGuides());
 
+const ARROWS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+
 document.addEventListener('keydown', (e) => {
   const typing = /input|textarea|select/i.test(document.activeElement?.tagName || '');
   if (typing) return;
@@ -323,6 +445,11 @@ document.addEventListener('keydown', (e) => {
   else if (e.key.toLowerCase() === 'o') setActive('outer');
   else if (e.key.toLowerCase() === 'i') setActive('inner');
   else if ((e.key === 'Delete' || e.key === 'Backspace') && editor.tool === 'points' && editor.selected >= 0) { e.preventDefault(); editor.deletePoint(); }
+  else if (ARROWS[e.key] && editor.tool === 'points' && editor.selected >= 0) {
+    e.preventDefault();
+    const [dx, dy] = ARROWS[e.key], step = e.shiftKey ? 5 : 1;   // millimetres
+    editor.nudgePoint(dx * step, dy * step);
+  }
   else if (e.key === 'Escape') { editor.selectPoint(-1); closeMenu(); }
 });
 
@@ -340,6 +467,14 @@ const PARAM_INPUTS = {
   pRidgeWidth: 'ridgeWidth', pRidgeHeight: 'ridgeHeight',
   pBridgeCount: 'bridgeCount', pBridgeWidth: 'bridgeWidth', pBridgeAngle: 'bridgeAngle',
 };
+// Push the current params back into their inputs (after opening a project).
+function syncParamInputs() {
+  for (const [id, key] of Object.entries(PARAM_INPUTS)) $(id).value = params[key];
+  $('pRidge').checked = params.ridge;
+  $('ridgeFields').hidden = !params.ridge;
+  $('pMirror').checked = params.mirror;
+}
+
 for (const [id, key] of Object.entries(PARAM_INPUTS)) {
   const el = $(id);
   el.value = params[key];
@@ -355,7 +490,7 @@ for (const [id, key] of Object.entries(PARAM_INPUTS)) {
 $('pRidge').addEventListener('change', (e) => {
   params.ridge = e.target.checked; $('ridgeFields').hidden = !params.ridge; onParamsChanged();
 });
-$('pMirror').addEventListener('change', (e) => { params.mirror = e.target.checked; onParamsChanged(); });
+$('pMirror').addEventListener('change', (e) => setMirror(e.target.checked));
 
 function onParamsChanged() {
   drawProfile();
@@ -388,25 +523,103 @@ function drawProfile() {
   `;
 }
 
-// ---------- presets ----------
-for (const [key, p] of Object.entries(PRESETS)) {
-  const o = document.createElement('option'); o.value = key; o.textContent = p.label; $('presetSelect').appendChild(o);
+// ---------- starter shapes ----------
+// A drop-down could only list the names, so the button opens a grid of previews. Each tile is
+// drawn from the very same anchors the editor is handed, so a picture here cannot drift away
+// from the shape it inserts.
+const presetBtn = $('presetBtn'), presetMenu = $('presetMenu');
+
+// The anchors as an SVG path: a curve wherever the two points around a segment have handles.
+function presetPath(pts) {
+  const n = pts.length, r = (v) => Math.round(v * 100) / 100;
+  let d = `M${r(pts[0].x)} ${r(pts[0].y)}`;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    if (a.out || b.in) {
+      d += `C${r(a.x + (a.out?.x || 0))} ${r(a.y + (a.out?.y || 0))}`
+         + ` ${r(b.x + (b.in?.x || 0))} ${r(b.y + (b.in?.y || 0))} ${r(b.x)} ${r(b.y)}`;
+    } else d += `L${r(b.x)} ${r(b.y)}`;
+  }
+  return `${d}Z`;
 }
-$('presetSelect').addEventListener('change', (e) => {
-  const p = PRESETS[e.target.value]; if (!p) return;
-  const pts = cleanPolygon(p.make(), 0.02);
+
+function applyPreset(key) {
+  const p = PRESETS[key]; if (!p) return;
+  // The shapes are drawn with Bézier handles, so they go in as they are: cleaning them
+  // through Clipper would flatten every curve into a polyline of hundreds of points.
+  const pts = p.make();
   if (editor.active === 'inner') {
-    // scale the preset to fit inside the outer shape
-    const ob = editor.getSize(), pb = bounds(pts);
+    // scale the shape to fit inside the outer wall (bounds of the curve, not of the handles)
+    const ob = editor.getSize(), pb = bounds(flatten(pts));
     const s = Math.min(ob.width, ob.height) * 0.5 / Math.max(pb.width, pb.height) || 1;
     const c = bounds(editor.getPoints());
-    editor.setPoints(pts.map(q => ({ x: c.cx + (q.x - pb.cx) * s, y: c.cy + (q.y - pb.cy) * s })), { record: true });
+    editor.setPoints(mapPts(pts, q => ({ x: c.cx + (q.x - pb.cx) * s, y: c.cy + (q.y - pb.cy) * s })), { record: true });
   } else {
     editor.setShape({ outer: pts, inner: [] }, { record: true, center: true });
   }
   setTool('move');
-  e.target.value = '';
+}
+
+for (const [key, p] of Object.entries(PRESETS)) {
+  const pts = p.make(), b = bounds(flatten(pts));
+  const box = Math.max(b.width, b.height) * 1.12;   // a square with a little air around the outline
+  const v = (n) => Math.round(n * 100) / 100;
+  const tile = document.createElement('button');
+  tile.type = 'button';
+  tile.className = 'preset-tile';
+  tile.dataset.preset = key;
+  tile.innerHTML = `<svg viewBox="${v(b.cx - box / 2)} ${v(b.cy - box / 2)} ${v(box)} ${v(box)}" aria-hidden="true">`
+    + `<path d="${presetPath(pts)}" vector-effect="non-scaling-stroke" /></svg><span></span>`;
+  tile.querySelector('span').textContent = p.label;
+  presetMenu.append(tile);
+}
+
+// Put the grid under the button and keep it inside the window: on a phone the button can sit
+// anywhere in a wrapped toolbar, and there may be more room above it than below.
+function placePresetMenu() {
+  const pad = 8, gap = 6, b = presetBtn.getBoundingClientRect();
+  presetMenu.style.maxHeight = '';                       // measure it at its natural height
+  const w = presetMenu.offsetWidth, h = presetMenu.scrollHeight;
+  const below = innerHeight - b.bottom - gap - pad, above = b.top - gap - pad;
+  const up = below < Math.min(h, 240) && above > below;
+  presetMenu.style.left = `${Math.round(Math.min(Math.max(pad, b.right - w), innerWidth - w - pad))}px`;
+  presetMenu.style.maxHeight = `${Math.round(Math.max(160, up ? above : below))}px`;
+  presetMenu.style.top = up ? 'auto' : `${Math.round(b.bottom + gap)}px`;
+  presetMenu.style.bottom = up ? `${Math.round(innerHeight - b.top + gap)}px` : 'auto';
+}
+let presetBtnTip = '';
+function setPresetMenu(open) {
+  presetMenu.hidden = !open;
+  presetBtn.setAttribute('aria-expanded', String(open));
+  // The button keeps the focus, and its own explanation would then sit on top of the grid
+  // it just opened; give the tip back when the grid closes.
+  if (open) {
+    presetBtnTip = presetBtn.dataset.tip || presetBtnTip;
+    delete presetBtn.dataset.tip;
+    hideTip();
+    placePresetMenu();
+  } else if (presetBtnTip) {
+    presetBtn.dataset.tip = presetBtnTip;
+  }
+}
+presetBtn.addEventListener('click', () => setPresetMenu(presetMenu.hidden));
+presetMenu.addEventListener('click', (e) => {
+  const tile = e.target.closest('[data-preset]');
+  if (!tile) return;
+  setPresetMenu(false);
+  applyPreset(tile.dataset.preset);
 });
+document.addEventListener('pointerdown', (e) => {
+  if (!presetMenu.hidden && !e.target.closest('.preset-picker')) setPresetMenu(false);
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !presetMenu.hidden) { setPresetMenu(false); presetBtn.focus(); }
+});
+window.addEventListener('resize', () => { if (!presetMenu.hidden) placePresetMenu(); });
+// It is fixed to the window, so a scroll anywhere but inside the grid itself moves the button away.
+window.addEventListener('scroll', (e) => {
+  if (!presetMenu.hidden && !presetMenu.contains(e.target)) placePresetMenu();
+}, true);
 
 // ---------- SVG upload (with a size dialog) ----------
 let pendingSvg = null;
@@ -473,8 +686,40 @@ function updatePointBar(sel) {
   $('ptRemoveCurveBtn').hidden = !curved;
   $('ptSyncBtn').hidden = !curved;
   $('ptSyncBtn').setAttribute('aria-pressed', String(p.smooth !== false));
+  setField('ptX', p.x); setField('ptY', p.y);
+  $('ptHandleIn').hidden = !curved;
+  $('ptHandleOut').hidden = !curved;
+  if (curved) {
+    setField('ptInX', p.in?.x ?? 0); setField('ptInY', p.in?.y ?? 0);
+    setField('ptOutX', p.out?.x ?? 0); setField('ptOutY', p.out?.y ?? 0);
+  }
   bar.hidden = false;
 }
+
+// Never overwrite the box someone is typing in — the selection is refreshed on every change.
+function setField(id, v) {
+  const el = $(id);
+  if (document.activeElement !== el) el.value = String(Math.round(v * 100) / 100);
+}
+
+function readPointFields() {
+  const i = editor.selected;
+  if (i < 0) return;
+  editor.movePoint(i, parseFloat($('ptX').value), parseFloat($('ptY').value));
+}
+function readHandleField(which) {
+  const i = editor.selected;
+  if (i < 0) return;
+  const px = which === 'in' ? 'ptInX' : 'ptOutX', py = which === 'in' ? 'ptInY' : 'ptOutY';
+  editor.setHandle(i, which, parseFloat($(px).value), parseFloat($(py).value));
+}
+['ptX', 'ptY'].forEach(id => $(id).addEventListener('change', readPointFields));
+['ptInX', 'ptInY'].forEach(id => $(id).addEventListener('change', () => readHandleField('in')));
+['ptOutX', 'ptOutY'].forEach(id => $(id).addEventListener('change', () => readHandleField('out')));
+// Enter commits without leaving the box, and the arrow keys are the spinner's, not the canvas'.
+['ptX', 'ptY', 'ptInX', 'ptInY', 'ptOutX', 'ptOutY'].forEach(id => {
+  $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } e.stopPropagation(); });
+});
 $('ptCurveBtn').addEventListener('click', () => editor.setCurve(editor.selected, 'add'));
 $('ptResetBtn').addEventListener('click', () => editor.setCurve(editor.selected, 'reset'));
 $('ptRemoveCurveBtn').addEventListener('click', () => editor.setCurve(editor.selected, 'remove'));
@@ -511,6 +756,161 @@ window.addEventListener('blur', closeMenu);
 $('fitBtn').addEventListener('click', () => viewer.fit());
 $('topBtn').addEventListener('click', () => viewer.viewTop());
 $('backBtn').addEventListener('click', () => viewer.viewFromBelow());
+
+// ---------- the cut piece ----------
+// What the cutter leaves behind, in a popup: the cut line filled in, the inner wall punched out,
+// shaded as a slab so it reads as clay on a worktop instead of as another drawing. A cutter is
+// used upside-down, so the piece comes out the way the 3D "Back" view shows it — mirrored from
+// the drawing unless Mirror is on. The colour belongs to the sitting, not to the cutter: it is
+// not saved with the project, it is only there to see the shape in the clay you will use.
+const resultDlg = $('resultDialog'), resultColors = $('resultColors');
+let clayColor = '#c8714a';
+
+$('resultBtn').addEventListener('click', openResult);
+
+function openResult() {
+  const shape = editor.getShape();
+  if (shape.outer.length < 3) { toast('Draw a shape first — then you can see the piece it cuts.'); return; }
+  const s = editor.getSize();
+  $('resultSize').textContent = `${s.width.toFixed(1)} × ${s.height.toFixed(1)} mm`;
+  syncResultMirror();
+  resultDlg.showModal();
+  renderResult();
+}
+
+// The stage has no size until the dialog is laid out, and it changes again with the window, so
+// the canvas follows its box rather than guessing when the box is ready.
+new ResizeObserver(() => renderResult()).observe($('resultCanvas').parentElement);
+
+resultColors.addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-color]');
+  if (b) setClayColor(b.dataset.color);
+});
+$('resultColor').addEventListener('input', (e) => setClayColor(e.target.value));
+
+function setClayColor(hex) {
+  clayColor = hex;
+  $('resultColor').value = hex;
+  for (const b of resultColors.querySelectorAll('button[data-color]'))
+    b.setAttribute('aria-pressed', String(b.dataset.color.toLowerCase() === hex.toLowerCase()));
+  renderResult();
+}
+
+// Mirror is one setting with two switches: the checkbox under Export and the button in the popup.
+function setMirror(on) {
+  params.mirror = on;
+  $('pMirror').checked = on;
+  onParamsChanged();
+  syncResultMirror();
+  renderResult();
+}
+$('resultMirrorBtn').addEventListener('click', () => setMirror(!params.mirror));
+
+function syncResultMirror() {
+  const row = $('resultMirror'), matters = mirrorMatters(editor.getShape());
+  row.hidden = !matters;
+  if (!matters) return;   // a shape that is its own mirror image comes out the same either way
+  $('resultMirrorText').textContent = params.mirror
+    ? 'The cutter is mirrored, so this comes out the same way round as you drew it.'
+    : 'A cutter is used upside-down, so this comes out mirrored from your drawing.';
+  $('resultMirrorBtn').setAttribute('aria-pressed', String(params.mirror));
+}
+
+// Does the Mirror setting change the piece at all? It does not for a shape that is its own
+// mirror image — the two results are then the same piece, turned round. Only the two obvious
+// axes are tested, and anything the test cannot settle counts as "it matters", so the sentence
+// is never withheld from a shape that really does come out back-to-front.
+function mirrorMatters(shape) {
+  if (shape.outer.length < 3) return false;
+  if (editor.sym.x || editor.sym.y) return false;
+  try { return !(sameAfterFlip(shape, 'x') || sameAfterFlip(shape, 'y')); } catch { return true; }
+}
+
+function sameAfterFlip(shape, axis) {
+  const c = bounds(shape.outer);
+  // both contours turn about the outer wall's centre, and the winding is restored with reverse()
+  const flip = (pts) => pts.map(p => ({ x: axis === 'x' ? 2 * c.cx - p.x : p.x, y: axis === 'y' ? 2 * c.cy - p.y : p.y })).reverse();
+  const area = (pts) => Math.abs(signedArea(pts));
+  const same = (pts) => {
+    const union = unionPolygons([pts, flip(pts)]).reduce((t, p) => t + area(p), 0);
+    return union <= area(pts) * 1.02;   // 2% of overhang counts as drawn by hand, not as asymmetric
+  };
+  return same(shape.outer) && (shape.inner.length < 3 || same(shape.inner));
+}
+
+// hex → rgb; amount > 0 lightens towards white, < 0 darkens towards black
+function shade(hex, amount) {
+  const h = hex.replace('#', '');
+  const n = h.length === 3 ? h.split('').map(c => c + c).join('') : h;
+  const v = parseInt(n, 16);
+  const ch = [(v >> 16) & 255, (v >> 8) & 255, v & 255]
+    .map(c => Math.round(amount > 0 ? c + (255 - c) * amount : c * (1 + amount)));
+  return `rgb(${ch[0]}, ${ch[1]}, ${ch[2]})`;
+}
+
+function renderResult() {
+  if (!resultDlg.open) return;
+  const cv = $('resultCanvas'), stage = cv.parentElement;
+  const w = Math.max(1, stage.clientWidth), h = Math.max(1, stage.clientHeight);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  cv.style.width = `${w}px`; cv.style.height = `${h}px`;
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const top = ctx.createRadialGradient(w / 2, h * 0.4, 0, w / 2, h * 0.4, Math.max(w, h) * 0.8);
+  top.addColorStop(0, '#2b2e3e'); top.addColorStop(1, '#14161f');
+  ctx.fillStyle = top; ctx.fillRect(0, 0, w, h);
+
+  const shape = editor.getShape();
+  if (shape.outer.length < 3) return;
+  // The face that meets the clay. A cutter is used upside-down, so unless the model is mirrored
+  // already the piece is a mirror image of the drawing. It is turned over left–right rather than
+  // top–bottom: the two differ only by turning the piece round on the table, and the sideways one
+  // keeps the drawing the right way up, so what you see is the mirroring and nothing else.
+  const face = (pts) => pts.map(p => ({ x: params.mirror ? p.x : -p.x, y: p.y }));
+  const outer = face(shape.outer), inner = shape.inner.length >= 3 ? face(shape.inner) : null;
+  const b = bounds(outer);
+  const scale = Math.min(w / Math.max(b.width, 0.001), h / Math.max(b.height, 0.001)) * 0.76;
+  const depth = Math.max(4, Math.min(16, Math.min(w, h) * 0.04));   // apparent thickness of the slab
+  const toPx = (p) => ({ x: w / 2 + (p.x - b.cx) * scale, y: h / 2 - depth / 2 + (p.y - b.cy) * scale });
+  const path = (pts) => {
+    const p0 = toPx(pts[0]); ctx.moveTo(p0.x, p0.y);
+    for (let i = 1; i < pts.length; i++) { const q = toPx(pts[i]); ctx.lineTo(q.x, q.y); }
+    ctx.closePath();
+  };
+  const piece = () => { ctx.beginPath(); path(outer); if (inner) path(inner); };
+
+  // a second copy pushed down behind the top face gives the piece a cut edge and a shadow
+  ctx.save();
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.5)'; ctx.shadowBlur = depth * 2.2; ctx.shadowOffsetY = depth * 0.8;
+  ctx.translate(0, depth);
+  piece(); ctx.fillStyle = shade(clayColor, -0.42); ctx.fill('evenodd');
+  ctx.restore();
+
+  // the top face, lit from above
+  ctx.save();
+  piece();
+  const lit = ctx.createLinearGradient(0, h / 2 - (b.height * scale) / 2, 0, h / 2 + (b.height * scale) / 2);
+  lit.addColorStop(0, shade(clayColor, 0.14)); lit.addColorStop(1, shade(clayColor, -0.09));
+  ctx.fillStyle = lit; ctx.fill('evenodd');
+  ctx.clip('evenodd');
+  // shading where the surface rolls over the cut edge: a fat line on the outline, blurred and
+  // clipped to the piece, so the edge darkens gradually instead of drawing a second outline.
+  // A browser without canvas filters simply gets the unblurred band.
+  ctx.filter = `blur(${(depth * 0.6).toFixed(1)}px)`;
+  ctx.lineWidth = depth * 1.6; ctx.strokeStyle = 'rgba(0, 0, 0, 0.2)'; ctx.lineJoin = 'round';
+  ctx.beginPath(); path(outer); if (inner) path(inner); ctx.stroke();
+  ctx.filter = 'none';
+  const sheen = ctx.createRadialGradient(w * 0.34, h * 0.28, 0, w * 0.34, h * 0.28, Math.max(w, h) * 0.62);
+  sheen.addColorStop(0, 'rgba(255, 255, 255, 0.16)'); sheen.addColorStop(1, 'rgba(255, 255, 255, 0)');
+  ctx.fillStyle = sheen; ctx.fillRect(0, 0, w, h);
+  ctx.restore();
+
+  piece(); ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0, 0, 0, 0.28)'; ctx.stroke();
+}
+
+setClayColor(clayColor);   // marks the swatch that is on; the canvas waits until the popup opens
 
 // ---------- confirm dialog ----------
 // For the few actions that reshape what is already drawn; resolves false on Cancel or Esc.
@@ -747,3 +1147,45 @@ document.addEventListener('keydown', (e) => {
 
 syncZoomUI(editor.view);
 syncWallActions();
+
+// ---------- which panels are on screen ----------
+// Each of the three panels can be switched off from the header so the others get its width: the
+// canvas on its own to draw in, or the 3D preview on its own to look at the cutter. The canvas and
+// the preview are the two panels that actually show the cutter, so one of them always stays —
+// the switch of the last one left is disabled instead of quietly doing nothing.
+const PANELS = {
+  draw: {
+    el: document.querySelector('.pane-draw'), btn: $('panelDrawBtn'), cls: 'panes-no-draw',
+    tip: 'Canvas — show or hide the drawing area. Hidden, its width goes to the 3D preview.',
+    stuck: 'Canvas — the only view on screen. Switch the 3D preview on first if you want to hide this one.',
+  },
+  view: {
+    el: document.querySelector('.pane-3d'), btn: $('panel3dBtn'), cls: 'panes-no-3d',
+    tip: '3D preview — show or hide the preview of the cutter. Hidden, its width goes to the canvas.',
+    stuck: '3D preview — the only view on screen. Switch the canvas on first if you want to hide this one.',
+  },
+  settings: {
+    el: document.querySelector('.pane-settings'), btn: $('panelSettingsBtn'), cls: 'panes-no-settings',
+    tip: 'Settings — show or hide the panel with the size, the walls and the export settings.',
+  },
+};
+const panelOn = { draw: true, view: true, settings: true };
+
+function syncPanels() {
+  for (const [key, p] of Object.entries(PANELS)) {
+    p.el.hidden = !panelOn[key];
+    p.btn.setAttribute('aria-pressed', String(panelOn[key]));
+    document.body.classList.toggle(p.cls, !panelOn[key]);
+  }
+  const alone = panelOn.draw !== panelOn.view;   // exactly one of the two views left
+  for (const key of ['draw', 'view']) {
+    const p = PANELS[key], stuck = alone && panelOn[key];
+    p.btn.disabled = stuck;
+    setTip(p.btn, stuck ? p.stuck : p.tip);
+  }
+}
+
+for (const [key, p] of Object.entries(PANELS)) {
+  p.btn.addEventListener('click', () => { panelOn[key] = !panelOn[key]; syncPanels(); });
+}
+syncPanels();

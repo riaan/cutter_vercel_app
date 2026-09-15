@@ -39,6 +39,7 @@ export class CutterViewer {
     this.ro = new ResizeObserver(() => this._resize());
     this.ro.observe(container);
     this._fitted = false;
+    this._fitPending = false;
     this._loop();
   }
 
@@ -47,6 +48,35 @@ export class CutterViewer {
     this.renderer.setSize(w, h, false);
     this.renderer.domElement.style.width = '100%'; this.renderer.domElement.style.height = '100%';
     this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
+    // A frame that was asked for while the panel was switched off is honoured now that there is
+    // something to frame it in. Cleared first: fit() measures again and would come straight back.
+    if (this._fitPending && this._onScreen()) { this._fitPending = false; this.fit(); }
+  }
+
+  _onScreen() { return this.container.clientWidth > 0 && this.container.clientHeight > 0; }
+
+  // A PNG of the current view for the project file. The frame is rendered explicitly and read
+  // back in the same task, while the drawing buffer is still intact — the renderer does not
+  // preserve it across frames. Returns null if the capture fails; the project saves without it.
+  snapshot(w = 1000, h = 750) {
+    const canvas = this.renderer.domElement;
+    const prevW = this.container.clientWidth, prevH = this.container.clientHeight;
+    try {
+      this.renderer.setSize(w, h, false);
+      this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
+      this.renderer.render(this.scene, this.camera);
+      const url = canvas.toDataURL('image/png');
+      const bin = atob(url.slice(url.indexOf(',') + 1));
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    } catch {
+      return null;
+    } finally {
+      this.renderer.setSize(Math.max(1, prevW), Math.max(1, prevH), false);
+      canvas.style.width = '100%'; canvas.style.height = '100%';
+      this.camera.aspect = Math.max(1, prevW) / Math.max(1, prevH); this.camera.updateProjectionMatrix();
+    }
   }
 
   _loop() {
@@ -87,6 +117,10 @@ export class CutterViewer {
 
   fit() {
     if (!this.bounds) return;
+    // The distance follows the aspect ratio, so the viewport has to be measured first — and while
+    // the 3D panel is switched off there is nothing to measure. Wait for it to come back.
+    if (!this._onScreen()) { this._fitPending = true; return; }
+    this._resize();
     const b = this.bounds;
     const r = Math.max(b.width, b.height, b.maxZ) * 0.75 + 10;
     const dist = this._distanceFor(r);

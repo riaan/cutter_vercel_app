@@ -76,6 +76,9 @@ body {
   overflow: hidden;
 }
 .pane-settings { display: block; padding: 11.2px; overflow-y: auto; }
+/* A panel switched off in the header leaves the grid altogether, so the ones that are left
+   share the whole width. The column templates per combination live with the breakpoints below. */
+.pane[hidden] { display: none; }
 
 .toolbar {
   display: flex; align-items: center; gap: 8.4px;
@@ -186,12 +189,6 @@ body {
 .btn.danger { color: var(--danger); }
 .btn.file { display: inline-flex; align-items: center; }
 .btn.toggle[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
-.btn.select {
-  appearance: none; -webkit-appearance: none; padding-right: 26px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath d='M6 8l4 4 4-4' fill='none' stroke='%239397AB' stroke-width='1.8'/%3E%3C/svg%3E");
-  background-repeat: no-repeat; background-position: right 7px center; background-size: 15px;
-}
-.btn.select option { background: var(--paper); color: var(--ink); }
 
 .segmented { display: inline-flex; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
 .seg {
@@ -211,6 +208,11 @@ body {
 .seg.active + .seg, .seg.active { border-left-color: transparent; }
 .seg:disabled { opacity: 0.45; cursor: not-allowed; }
 .segmented.small .seg { padding: 5px 10px; min-height: 30px; font-size: 12px; }
+/* The panel switches are on/off, not one-of-three, so they mark themselves with aria-pressed. */
+.seg.toggle[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+.seg.toggle[aria-pressed="true"] + .seg { border-left-color: transparent; }
+/* The last panel still showing something cannot be switched off; it is not broken, just stuck. */
+.seg.toggle[aria-pressed="true"]:disabled { opacity: 1; cursor: default; }
 
 .slider { display: flex; flex-direction: column; gap: 5.6px; color: var(--muted); font-size: 12px; }
 .slider .row { display: flex; justify-content: space-between; }
@@ -233,6 +235,7 @@ body {
 .flyout-head .group-label { margin-right: auto; }
 .flyout section { display: flex; flex-direction: column; gap: 5.6px; }
 .flyout .row-btns { display: flex; gap: 5.6px; flex-wrap: wrap; }
+.sec-body .row-btns { display: flex; gap: 5.6px; flex-wrap: wrap; }
 .flyout .note { margin: 0; }
 .flyout hr { height: 1px; border: 0; background: var(--hairline); margin: 0; }
 
@@ -313,9 +316,19 @@ body {
 /* ---------- responsive ---------- */
 @media (min-width: 1181px) {
   body { height: 100dvh; }
+  /* one template per combination of switched-off panels; at most one of draw / 3D can be off */
+  body.panes-no-settings .workspace { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
+  body.panes-no-draw .workspace,
+  body.panes-no-3d .workspace { grid-template-columns: minmax(0, 1fr) 316px; }
+  body.panes-no-draw.panes-no-settings .workspace,
+  body.panes-no-3d.panes-no-settings .workspace { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 1180px) {
   .workspace { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto auto; overflow: visible; }
+  body.panes-no-draw .workspace,
+  body.panes-no-3d .workspace { grid-template-columns: minmax(0, 1fr); }
+  .segmented.panels .seg span { display: none; }   /* icons only; the tooltip names them */
+  .tagline { display: none; }                      /* the header is full; the strapline goes first */
   .pane-settings { grid-column: 1 / -1; }
   .pane-settings .sec-body { display: grid; grid-template-columns: 1fr 1fr; column-gap: 22.4px; align-items: start; }
   .pane-settings .sec-body > .note, .pane-settings .sec-body > .check,
@@ -326,6 +339,7 @@ body {
 }
 @media (max-width: 760px) {
   .top { padding: 8.4px 11.2px; }
+  .top-actions { flex-wrap: wrap; justify-content: flex-end; gap: 8.4px; }
   .tagline, .ready { display: none; }
   .top-actions #downloadBtn { display: none; }
   .workspace { grid-template-columns: minmax(0, 1fr); gap: 11.2px; padding: 0 11.2px 84px; }
@@ -346,10 +360,25 @@ body {
 
 /* ---------- point editing ---------- */
 .point-bar {
-  position: absolute; right: 11.2px; top: 11.2px; display: flex; gap: 5.6px; align-items: center; flex-wrap: wrap; justify-content: flex-end;
+  position: absolute; right: 11.2px; top: 11.2px; display: flex; flex-direction: column; gap: 5.6px; align-items: stretch;
   background: var(--paper); box-shadow: var(--shadow-md); border-radius: var(--radius);
-  padding: 5.6px; font-size: 11px; color: var(--muted);
+  padding: 5.6px; font-size: 11px; color: var(--muted); max-width: calc(100% - 22.4px);
 }
+.point-bar-row { display: flex; gap: 5.6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+/* one line per group: label, x, y — so the boxes stay in two straight columns */
+.point-fields { display: flex; flex-direction: column; gap: 4px; align-items: stretch; padding: 2px 4px 0; }
+.point-fields .field-group { display: flex; gap: 6px; align-items: center; justify-content: flex-end; }
+.point-fields .field-group[hidden] { display: none; }
+.point-fields .field-label {
+  margin-right: auto; font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint);
+}
+.point-fields label { display: inline-flex; align-items: center; gap: 3px; color: var(--faint); }
+.point-fields input {
+  font: inherit; font-size: 12px; color: var(--ink); border: 0; background: var(--sunken);
+  box-shadow: inset 0 0 0 1px var(--hairline); border-radius: 6px;
+  caret-color: var(--accent); padding: 4px 5px; width: 56px;
+}
+.point-fields input:focus { outline: none; box-shadow: inset 0 0 0 1px var(--accent); }
 .point-bar #pointLabel {
   display: inline-flex; align-items: center; gap: 5px; padding: 0 6px;
   font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent);
@@ -381,6 +410,41 @@ body {
 .dialog h3 { display: flex; align-items: center; gap: 8.4px; margin: 0; font-size: 20px; font-weight: 500; letter-spacing: -0.015em; }
 .dialog h3 i { color: var(--accent); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 5.6px; margin-top: 5.6px; }
+
+/* ---------- cut-piece preview ---------- */
+/* The stage is a dark worktop; the piece is painted onto it by app.js, so the only job here is
+   to give the canvas a box with a fixed shape to measure itself against. */
+.result-dialog { width: min(94vw, 520px); }
+.result-stage {
+  position: relative; width: 100%; aspect-ratio: 4 / 3;
+  border-radius: var(--radius); overflow: hidden;
+  background: var(--sunken); box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.result-stage canvas { display: block; width: 100%; height: 100%; }
+.result-meta { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8.4px; }
+.result-size { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.result-mirror { display: flex; align-items: center; gap: 8.4px; flex-wrap: wrap; }
+.result-mirror > span { font-size: 12px; color: var(--faint); max-width: 40ch; }
+.result-mirror[hidden] { display: none; }
+.result-colors { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.result-colors .group-label { margin-right: 2.8px; }
+.swatch {
+  width: 30px; height: 30px; flex: none; padding: 0; border: 0; border-radius: 50%;
+  background: var(--sw, var(--line)); cursor: pointer;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--hairline);
+}
+.swatch[aria-pressed="true"] { box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35), 0 0 0 2px var(--accent); }
+.swatch:focus-visible { outline: 2px solid var(--accent-light); outline-offset: 2px; }
+/* The last swatch opens the browser's own colour picker; the ring says "any colour". */
+.swatch.custom {
+  position: relative; display: grid; place-items: center; overflow: hidden;
+  background: conic-gradient(#f56c6c, #f5c26c, #b7f56c, #6cf5b0, #6cd0f5, #8a6cf5, #f56cd0, #f56c6c);
+}
+.swatch.custom input {
+  position: absolute; inset: -20%; width: 140%; height: 140%;
+  padding: 0; border: 0; opacity: 0; cursor: pointer;
+}
+.swatch.custom i { font-size: 13px; color: #fff; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55); pointer-events: none; }
 
 /* ---------- explanation tooltips ---------- */
 /* Native title tooltips are slow, unstyled and never appear on touch. app.js moves every
@@ -438,6 +502,45 @@ body {
 
 /* The canvas setup flyout shares this corner — while it is open it sits on top. */
 .flyout { z-index: 8; }
+
+/* ---------- starter shapes picker ----------
+   A drop-down list cannot show what a shape looks like, so the button opens a grid of
+   previews instead. Every tile is drawn from the shape's own anchors (app.js), so a picture
+   here can never drift away from the outline it inserts. */
+.preset-picker { position: relative; display: inline-flex; }
+/* Fixed, not absolute: the drawing pane clips what overflows it, and on a phone the grid is
+   taller than the pane. app.js puts it under the button and keeps it inside the window. */
+.preset-menu {
+  position: fixed; z-index: 12;
+  width: 276px; max-width: calc(100vw - 22.4px); overflow: auto;
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5.6px;
+  padding: 8.4px; border-radius: var(--radius-lg);
+  background: var(--paper); box-shadow: var(--shadow-md);
+}
+.preset-menu[hidden] { display: none; }
+.preset-tile {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 7px 4px 5px; min-height: 36px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: transparent; color: var(--ink); font: inherit; font-size: 11px; cursor: pointer;
+}
+.preset-tile svg { display: block; width: 100%; height: auto; aspect-ratio: 1; }
+.preset-tile path {
+  fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round;
+}
+/* the names run to two words, so they wrap rather than being cut off; the two lines are
+   always reserved, which keeps every tile in the grid the same size */
+.preset-tile span { text-align: center; line-height: 1.25; min-height: 2.5em; }
+.preset-tile:hover { border-color: var(--accent); background: var(--accent-soft); }
+.preset-tile:hover path { fill: rgba(145, 132, 217, 0.26); }
+.preset-tile:active { background: rgba(145, 132, 217, 0.22); }
+.preset-tile:focus-visible { outline: 2px solid var(--accent-light); outline-offset: 1px; }
+/* Phones: bigger tiles for thumbs, and enough height that the last row is not cut in half.
+   This block has to come after the rules above, not with the other phone rules further up. */
+@media (max-width: 760px) {
+  .preset-menu { width: min(324px, calc(100vw - 22.4px)); }
+  .preset-tile { padding: 9px 4px 7px; }
+}
 
 /* ---------- canvas grid control (bottom left, where the scale bar used to be painted) ---------- */
 .canvas-grid {

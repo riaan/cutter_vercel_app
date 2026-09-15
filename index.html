@@ -27,12 +27,24 @@
       <span class="tagline">Draw a shape, print a cutter</span>
     </div>
     <div class="top-actions">
+      <!-- which of the three panels are on screen; hiding one gives its width to the others -->
+      <div class="segmented panels" role="group" aria-label="Which panels to show">
+        <button class="seg toggle" id="panelDrawBtn" aria-pressed="true" aria-label="Canvas panel" title="Canvas — show or hide the drawing area. Hidden, its width goes to the 3D preview."><i class="ph ph-pencil-simple"></i><span>Canvas</span></button>
+        <button class="seg toggle" id="panel3dBtn" aria-pressed="true" aria-label="3D preview panel" title="3D preview — show or hide the preview of the cutter. Hidden, its width goes to the canvas."><i class="ph ph-cube"></i><span>3D</span></button>
+        <button class="seg toggle" id="panelSettingsBtn" aria-pressed="true" aria-label="Settings panel" title="Settings — show or hide the panel with the size, the walls and the export settings."><i class="ph ph-sliders-horizontal"></i><span>Settings</span></button>
+      </div>
+      <span class="divider"></span>
       <div class="pair">
         <button class="btn icon" id="undoBtn" title="Undo — take back the last change (Ctrl+Z)" disabled><i class="ph ph-arrow-u-up-left"></i></button>
         <button class="btn icon" id="redoBtn" title="Redo — put back the change you just undid (Ctrl+Y)" disabled><i class="ph ph-arrow-u-up-right"></i></button>
       </div>
       <span class="divider"></span>
       <span class="ready" id="readyNote">No shape yet</span>
+      <div class="pair">
+        <button class="btn icon" id="saveProjectBtn" title="Save project — keep this drawing and all its settings as a .cutter file, with the STL and previews inside. Open it later to carry on exactly where you left off." disabled><i class="ph ph-floppy-disk"></i></button>
+        <button class="btn icon" id="openProjectBtn" title="Open project — load a .cutter file you saved earlier. It replaces what is on the canvas."><i class="ph ph-folder-open"></i></button>
+      </div>
+      <input type="file" id="projectInput" accept=".cutter,application/zip" hidden />
       <button class="btn primary" id="downloadBtn" disabled><i class="ph ph-download-simple"></i>Download STL</button>
     </div>
   </header>
@@ -52,9 +64,14 @@
             <i class="ph ph-upload-simple"></i>Upload SVG
             <input type="file" id="svgInput" accept=".svg,image/svg+xml" hidden />
           </label>
-          <select id="presetSelect" class="btn ghost select" aria-label="Starter shape">
-            <option value="">Starter shapes…</option>
-          </select>
+          <div class="preset-picker">
+            <button class="btn ghost" id="presetBtn" aria-haspopup="true" aria-expanded="false" aria-controls="presetMenu"
+                    title="Starter shapes — begin from a ready-made outline instead of a blank canvas. It replaces what you have drawn.">
+              <i class="ph ph-shapes"></i>Starter shapes<i class="ph ph-caret-down"></i>
+            </button>
+            <!-- the grid of previews is filled in by app.js, drawn from the shapes themselves -->
+            <div class="preset-menu" id="presetMenu" hidden role="dialog" aria-label="Starter shapes"></div>
+          </div>
         </div>
       </div>
 
@@ -142,13 +159,33 @@
         </div>
 
         <div class="point-bar" id="pointBar" hidden>
-          <span id="pointLabel">Point</span>
-          <span class="divider"></span>
-          <button class="btn ghost small" id="ptCurveBtn"><i class="ph ph-bezier-curve"></i>Curve</button>
-          <button class="btn ghost small" id="ptResetBtn" hidden><i class="ph ph-arrow-counter-clockwise"></i>Reset</button>
-          <button class="btn ghost small" id="ptRemoveCurveBtn" hidden><i class="ph ph-line-segment"></i>Straight</button>
-          <button class="btn ghost small toggle" id="ptSyncBtn" aria-pressed="true" hidden title="Keep both handles in line for a smooth curve. Off: move each handle on its own (sharp corner allowed)."><i class="ph ph-link-simple"></i>Sync handles</button>
-          <button class="btn ghost small danger" id="ptDeleteBtn"><i class="ph ph-trash"></i>Delete</button>
+          <div class="point-bar-row">
+            <span id="pointLabel">Point</span>
+            <span class="divider"></span>
+            <button class="btn ghost small" id="ptCurveBtn"><i class="ph ph-bezier-curve"></i>Curve</button>
+            <button class="btn ghost small" id="ptResetBtn" hidden><i class="ph ph-arrow-counter-clockwise"></i>Reset</button>
+            <button class="btn ghost small" id="ptRemoveCurveBtn" hidden><i class="ph ph-line-segment"></i>Straight</button>
+            <button class="btn ghost small toggle" id="ptSyncBtn" aria-pressed="true" hidden title="Keep both handles in line for a smooth curve. Off: move each handle on its own (sharp corner allowed)."><i class="ph ph-link-simple"></i>Sync handles</button>
+            <button class="btn ghost small danger" id="ptDeleteBtn"><i class="ph ph-trash"></i>Delete</button>
+          </div>
+          <!-- exact position of the point, and of its curve handles; arrow keys step it by 1 mm -->
+          <div class="point-fields">
+            <span class="field-group" title="Position of this point — x to the right, y downwards, from the middle of the canvas. Arrow keys move it by 1 mm (5 mm with Shift).">
+              <span class="field-label">Position</span>
+              <label>x<input type="number" id="ptX" step="0.1" /></label>
+              <label>y<input type="number" id="ptY" step="0.1" /></label>
+            </span>
+            <span class="field-group" id="ptHandleIn" hidden title="Where the curve handle towards the previous point sits, measured from the point itself.">
+              <span class="field-label">Handle in</span>
+              <label>x<input type="number" id="ptInX" step="0.1" /></label>
+              <label>y<input type="number" id="ptInY" step="0.1" /></label>
+            </span>
+            <span class="field-group" id="ptHandleOut" hidden title="Where the curve handle towards the next point sits, measured from the point itself.">
+              <span class="field-label">Handle out</span>
+              <label>x<input type="number" id="ptOutX" step="0.1" /></label>
+              <label>y<input type="number" id="ptOutY" step="0.1" /></label>
+            </span>
+          </div>
         </div>
 
         <!-- edit 3: the flyout — same ids as the old assist bar, so app.js needs no rewiring -->
@@ -199,6 +236,8 @@
           <button class="btn ghost small" id="fitBtn" title="Fit — zoom the camera so the whole cutter is in view"><i class="ph ph-crop"></i>Fit</button>
           <button class="btn ghost small" id="topBtn" title="Top — look straight down at the cutter, the same way round as your drawing"><i class="ph ph-arrow-square-down"></i>Top</button>
           <button class="btn ghost small" id="backBtn" title="Back — look at the cutter from the cutting edge, the side that meets the dough"><i class="ph ph-knife"></i>Back</button>
+          <span class="divider"></span>
+          <button class="btn ghost small" id="resultBtn" disabled title="Cut piece — see the piece this cutter leaves behind, in the colour of the clay you are going to use"><i class="ph ph-shapes"></i>Cut piece</button>
         </div>
       </div>
       <div class="viewer-wrap">
@@ -286,6 +325,11 @@
             <span>Mirror the model <span class="aside">— for letters and other asymmetric shapes, so the cut piece matches the drawing (a cutter is used upside-down)</span></span>
           </label>
           <p class="note boxed"><i class="ph ph-printer"></i><span>Print with the wide base on the bed, no supports. PLA or PETG, 0.2 mm layers, 3–4 walls.</span></p>
+          <div class="row-btns">
+            <button class="btn" type="button" id="saveProjectBtn2" disabled><i class="ph ph-floppy-disk"></i>Save project</button>
+            <button class="btn" type="button" id="openProjectBtn2"><i class="ph ph-folder-open"></i>Open project</button>
+          </div>
+          <p class="note"><span>A project file keeps the drawing and every setting, plus the STL and two pictures. Open it later and you get exactly the same cutter back.</span></p>
         </div>
       </div>
     </aside>
@@ -328,6 +372,41 @@
       <div class="dialog-actions">
         <button type="button" class="btn ghost" id="svgCancelBtn">Cancel</button>
         <button type="submit" class="btn primary" id="svgImportBtn"><i class="ph ph-check"></i>Import</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- The piece the cutter leaves behind. It is shown the way round the cutting edge meets the
+       clay (the 3D "Back" view), and painted in a colour you pick, so the result is something you
+       can look at before printing. -->
+  <dialog class="dialog result-dialog" id="resultDialog">
+    <form method="dialog">
+      <h3><i class="ph ph-shapes"></i>The cut piece</h3>
+      <div class="result-stage"><canvas id="resultCanvas" aria-label="The piece this cutter cuts out"></canvas></div>
+      <div class="result-meta">
+        <span class="result-size" id="resultSize">—</span>
+        <span class="result-mirror" id="resultMirror" hidden>
+          <span id="resultMirrorText"></span>
+          <button type="button" class="btn ghost small toggle" id="resultMirrorBtn" aria-pressed="false" title="Match my drawing — mirror the cutter so the piece comes out the same way round as you drew it. This is the Mirror setting under Export."><i class="ph ph-flip-horizontal"></i>Match my drawing</button>
+        </span>
+      </div>
+      <div class="result-colors" id="resultColors" role="group" aria-label="Colour of the clay">
+        <span class="group-label">Clay</span>
+        <button type="button" class="swatch" data-color="#c8714a" aria-pressed="false" style="--sw:#c8714a" title="Terracotta"></button>
+        <button type="button" class="swatch" data-color="#d9a441" aria-pressed="false" style="--sw:#d9a441" title="Ochre"></button>
+        <button type="button" class="swatch" data-color="#f0e3cd" aria-pressed="false" style="--sw:#f0e3cd" title="Cream"></button>
+        <button type="button" class="swatch" data-color="#e79fb0" aria-pressed="false" style="--sw:#e79fb0" title="Blush"></button>
+        <button type="button" class="swatch" data-color="#a78bfa" aria-pressed="false" style="--sw:#a78bfa" title="Lilac"></button>
+        <button type="button" class="swatch" data-color="#8fb996" aria-pressed="false" style="--sw:#8fb996" title="Sage"></button>
+        <button type="button" class="swatch" data-color="#6aa9e9" aria-pressed="false" style="--sw:#6aa9e9" title="Sky"></button>
+        <button type="button" class="swatch" data-color="#3c4050" aria-pressed="false" style="--sw:#3c4050" title="Slate"></button>
+        <label class="swatch custom" title="Any other colour — opens the colour picker">
+          <input type="color" id="resultColor" value="#c8714a" aria-label="Pick any colour" />
+          <i class="ph ph-plus"></i>
+        </label>
+      </div>
+      <div class="dialog-actions">
+        <button type="submit" class="btn primary"><i class="ph ph-check"></i>Done</button>
       </div>
     </form>
   </dialog>

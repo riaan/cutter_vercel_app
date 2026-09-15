@@ -43,6 +43,13 @@ const fixed = [
   ['star + small hole', { outer: star, inner: circ(8) }, {}],
   ['mirrored', { outer: star, inner: circ(8) }, { mirror: true }],
 ];
+// The starter shapes, flattened and cleaned exactly the way app.js does before building.
+const { PRESETS } = await import(path.join(root, 'js/presets.js'));
+const { flatten } = await import(path.join(root, 'js/editor.js'));
+for (const [key, p] of Object.entries(PRESETS)) {
+  fixed.push([`starter shape: ${key}`, G.cleanPolygon(flatten(p.make()), 0.002), {}]);
+}
+
 let failed = 0;
 for (const [label, shape, params] of fixed) {
   const t0 = Date.now();

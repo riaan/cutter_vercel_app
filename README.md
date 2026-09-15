@@ -11,12 +11,20 @@ no accounts — everything runs in the browser.
 - **Tool explanation**: picking a tool shows a short line at the canvas' top left for five
   seconds; it then slides away into an (i) that brings it back on hover (tap on touch).
 - **Points** tool: tap to place corners, drag them, tap a line to insert a corner,
-  double-tap a corner to delete it.
+  double-tap a corner to delete it. The arrow keys nudge the selected corner by 1 mm
+  (5 mm with Shift), and holding Shift while dragging keeps it on one straight line —
+  horizontal or vertical for a corner, also diagonal for a curve handle. The bar at the
+  canvas' top right shows the exact position of the corner (and of its curve handles),
+  which you can type over.
 - **Move & resize**: drag the shape, corner/edge handles to resize, top knob to rotate
   (snaps to 15°), two-finger pinch/twist on touch screens.
 - **Upload SVG**: any SVG with paths or basic shapes. A dialog asks for the size (prefilled
   from the SVG's physical units, or 80 mm wide). Multiple shapes are merged; a hole becomes the inner wall.
-- **Starter shapes**: circle, heart, star, rounded square, flower, gingerbread man, tree.
+- **Starter shapes**: circle, heart, star, rounded square, flower, gingerbread man, tree —
+  picked from a grid of previews, so you can see each one before you insert it.
+  They arrive as a handful of points with curve handles (a circle is four points, the gingerbread
+  man twenty), so you can reshape one with the *Points* tool instead of pushing hundreds of dots
+  around. The outlines themselves are unchanged.
 - **Inner wall**: switch *Editing* to "Inner wall" and draw a hole (or upload an SVG that has one).
   The area between the walls is what gets cut. Bars at base level connect the inner wall to
   the outer wall so it keeps its position; count, thickness (auto = 10% of the width) and
@@ -44,15 +52,30 @@ no accounts — everything runs in the browser.
   dragging with the **right mouse button** (or the middle one), or turn on the *hand* button and
   drag normally — on touch, two fingers pinch and pan. Panning never moves the shape itself.
   Keyboard: `+` / `-` zoom, `0` reset, `H` toggles panning.
+- **Show or hide the panels**: the three switches at the top — *Canvas*, *3D*, *Settings* — turn
+  each panel off and on. What is left takes over the space, so you can draw across the full width
+  or look at nothing but the cutter. At least one of the canvas and the 3D preview stays on:
+  the switch of the last one left is greyed out. Everything is on again when you reload.
 - **Exact size**: width/height inputs in mm with a proportion lock.
 - **Cutter walls**: cutter height, blade thickness, base (flange) width/thickness,
   optional support step — with a live cross-section diagram.
 - **Live 3D preview** (drag to orbit, pinch/scroll to zoom), footprint size, volume and
   an estimated PLA weight. *Top* matches the drawing; *Back* looks at the cutting edge.
+- **Cut piece preview**: *Cut piece* (next to the 3D view buttons) opens a popup with the piece
+  the cutter leaves behind, painted in a clay colour you pick from the swatches or from the
+  browser's own colour picker. It is shown the way the piece comes out: the right way up, but
+  mirrored left–right when the cutter is not mirrored — so a shape that will come out
+  back-to-front says so, with a button that mirrors the cutter for you. The colour is only for looking at; it is not part of the cutter and
+  is not saved.
 - **Download STL**: a watertight single-body mesh centred on the print bed. The solid is
   built with a CSG kernel (Manifold), so slicers report no open or non-manifold edges. By default the top
   view of the model equals the drawing; turn on *Mirror the model* when the cut piece must
   match the drawing exactly (a cutter is used upside-down, so letters would otherwise come out mirrored).
+- **Save / open a project**: *Save project* writes a `.cutter` file holding the drawing and
+  every setting; open it later and you get exactly the same cutter back. It is a plain zip —
+  rename it to `.zip` and you will find `project.json`, the `model.stl` as downloaded, and a
+  picture of the drawing and of the 3D view. Only `project.json` is read back; the mesh is
+  rebuilt from it.
 
 ## Run locally
 
@@ -60,7 +83,7 @@ Requires Node.js 18+ (any recent version). No dependencies to install.
 
 ```bash
 node dev-server.js        # or: npm run dev
-# open http://localhost:3000
+# open http://localhost:3002
 ```
 
 Any static server works too, e.g. `python3 -m http.server 3000`.
@@ -91,14 +114,17 @@ steps. `CLAUDE.md`, `GEMINI.md`, `.cursor/rules` and `.github/copilot-instructio
 ```
 index.html          page + settings panel
 styles.css          layout & theme (responsive: desktop / tablet / phone)
-js/app.js           wiring: UI, live regeneration, STL download
+js/app.js           wiring: UI, live regeneration, STL download, save/open project
 js/editor.js        2D canvas editor (draw / points / move & resize, undo, gestures)
 js/geometry.js      polygon clean-up, offsetting, mesh building, STL writer
 js/svgimport.js     SVG → outline (uses the browser's own path engine)
 js/viewer.js        three.js preview
 js/presets.js       starter shapes
+js/project.js       .cutter project file: what is saved, and reading it back
+js/zip.js           tiny zip reader/writer for the project file
 vendor/             three.js (+ OrbitControls), clipper-lib and manifold-3d (WebAssembly), vendored
 tests/mesh-check.mjs mesh integrity test: node tests/mesh-check.mjs 100
+tests/project-roundtrip.mjs  save → open → same mesh: node tests/project-roundtrip.mjs
 dev-server.js       zero-dependency static server for local testing
 ```
 

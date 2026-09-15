@@ -18,6 +18,14 @@ const ZOOM_STEP = 1.25; // one press of zoom in / out
 
 const ROTATE_CURSOR = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M12 4a8 8 0 1 1-7.5 5' fill='none' stroke='white' stroke-width='4.5' stroke-linecap='round'/%3E%3Cpath d='M12 4a8 8 0 1 1-7.5 5' fill='none' stroke='%2314202B' stroke-width='2' stroke-linecap='round'/%3E%3Cpath d='M3 4.5v5h5' fill='none' stroke='white' stroke-width='4.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M3 4.5v5h5' fill='none' stroke='%2314202B' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 12 12, auto`;
 
+// Nearest multiple of 45° for a handle vector, keeping its length (Shift while dragging).
+const snapAngle45 = (h) => {
+  const l = Math.hypot(h.x, h.y);
+  if (!l) return h;
+  const a = Math.round(Math.atan2(h.y, h.x) / (Math.PI / 4)) * (Math.PI / 4);
+  return { x: Math.cos(a) * l, y: Math.sin(a) * l };
+};
+
 const copyPt = (p) => {
   const q = { x: p.x, y: p.y };
   if (p.in) q.in = { x: p.in.x, y: p.in.y };
@@ -29,7 +37,7 @@ const copy = (pts) => pts.map(copyPt);
 const copyShape = (s) => ({ outer: copy(s.outer), inner: copy(s.inner) });
 
 // Apply a geometric transform to anchors and handles alike.
-function mapPts(pts, f) {
+export function mapPts(pts, f) {
   return pts.map(p => {
     const q = f(p), r = { x: q.x, y: q.y };
     if (p.in) { const a = f({ x: p.x + p.in.x, y: p.y + p.in.y }); r.in = { x: a.x - q.x, y: a.y - q.y }; }
@@ -212,6 +220,91 @@ export class ShapeEditor {
     this.setShape(s, opts);
   }
 
+  // ----- saving and opening a project -----
+  // The seeds are handed out as they are stored: in symmetry mode that is the edited half,
+  // which is exactly what setState() expects back.
+  getState() {
+    return {
+      shape: copyShape(this.shape),
+      sym: { ...this.sym },
+      active: this.active,
+      tool: this.tool,
+      smoothing: this.smoothing,
+      lockAspect: this.lockAspect,
+      grid: { ...this.grid },
+    };
+  }
+
+  // Restores a saved project. The seeds go in untouched — _toSeeds() must not run, or a
+  // symmetric half would be clipped a second time.
+  setState(st) {
+    this.sym = { x: !!st.sym?.x, y: !!st.sym?.y };
+    this.shape = { outer: copy(st.shape?.outer || []), inner: copy(st.shape?.inner || []) };
+    this.active = st.active === 'inner' && this.shape.inner.length >= 3 ? 'inner' : 'outer';
+    this.tool = ['draw', 'points', 'move'].includes(st.tool) ? st.tool : 'move';
+    if (typeof st.smoothing === 'number') this.smoothing = st.smoothing;
+    if (typeof st.lockAspect === 'boolean') this.lockAspect = st.lockAspect;
+    if (st.grid) this.grid = { size: Math.max(0.5, st.grid.size || 10), snap: !!st.grid.snap };
+    this.undoStack.length = 0; this.redoStack.length = 0;
+    this.stroke = null; this.drag = null; this.gesture = null; this.viewGesture = null;
+    this._displayCache = { key: null };
+    this._select(-1);
+    this.view.manual = false;
+    this._autoFit();
+    this._changed();
+    this.onView(this.view);
+  }
+
+  // A clean picture of the drawing for the project file: shape and walls only, no grid,
+  // guides, handles or dimensions, fitted to the given size.
+  renderPreview(w = 1000, h = 1000, { background = this.colors.paper, pad = 0.07 } = {}) {
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = background; ctx.fillRect(0, 0, w, h);
+
+    const disp = this._display();
+    if (disp.outer.length < 2) return cv;
+    const rings = disp.outer.length >= 3 ? this.ringsProvider(disp) : null;
+    const b = bounds(rings && rings.base && rings.base.length >= 3 ? rings.base : disp.outer);
+    const s = Math.min(w / Math.max(b.width, 0.001), h / Math.max(b.height, 0.001)) * (1 - 2 * pad);
+    const toPx = (p) => ({ x: w / 2 + (p.x - b.cx) * s, y: h / 2 + (p.y - b.cy) * s });
+    const path = (pts) => {
+      if (!pts || pts.length < 2) return;
+      const p0 = toPx(pts[0]); ctx.moveTo(p0.x, p0.y);
+      for (let i = 1; i < pts.length; i++) { const q = toPx(pts[i]); ctx.lineTo(q.x, q.y); }
+      ctx.closePath();
+    };
+    const band = (outerRing, innerRing, fill) => {
+      if (!outerRing || !innerRing) return;
+      ctx.beginPath(); path(outerRing); path(innerRing);
+      ctx.fillStyle = fill; ctx.fill('evenodd');
+    };
+    const C = this.colors;
+    const hasInner = disp.inner.length >= 3;
+
+    ctx.beginPath(); path(disp.outer); if (hasInner) path(disp.inner);
+    ctx.fillStyle = C.dough; ctx.fill('evenodd');
+    if (rings) {
+      band(rings.base, disp.outer, C.base);
+      band(rings.ridge, disp.outer, C.base);
+      band(rings.blade, disp.outer, C.blade);
+      if (hasInner) {
+        band(disp.inner, rings.innerBase, C.base);
+        band(disp.inner, rings.innerRidge, C.base);
+        band(disp.inner, rings.innerBlade, C.blade);
+      }
+      if (rings.bridges && rings.bridges.length) {
+        ctx.beginPath(); for (const g of rings.bridges) path(g);
+        ctx.fillStyle = 'rgba(145,132,217,0.16)'; ctx.fill();
+      }
+    }
+    ctx.lineWidth = Math.max(1.5, s * 0.15); ctx.strokeStyle = C.doughLine; ctx.lineJoin = 'round';
+    ctx.beginPath(); path(disp.outer); ctx.stroke();
+    if (hasInner) { ctx.beginPath(); path(disp.inner); ctx.stroke(); }
+    return cv;
+  }
+
   clear() {
     if (this.active === 'outer') { if (!this.shape.outer.length && !this.shape.inner.length) return; this.setShape({ outer: [], inner: [] }); }
     else { if (!this.shape.inner.length) return; this.setPoints([]); }
@@ -369,6 +462,42 @@ export class ShapeEditor {
       if (p.smooth === undefined) p.smooth = true;
     }
     this._changed();
+  }
+
+  // Move a point to an absolute position (properties panel, arrow keys).
+  movePoint(i, x, y, { record = true } = {}) {
+    const p = this.points[i];
+    if (!p || !isFinite(x) || !isFinite(y)) return;
+    if (record) this._record();
+    const c = this._clamp({ x, y });
+    p.x = c.x; p.y = c.y;
+    this._changed();
+  }
+
+  // Arrow keys: step the selected point by a whole number of millimetres.
+  nudgePoint(dx, dy, i = this.selected) {
+    const p = this.points[i];
+    if (!p) return;
+    this.movePoint(i, p.x + dx, p.y + dy);
+  }
+
+  // Set one Bézier handle as an offset from its anchor (properties panel).
+  setHandle(i, which, x, y) {
+    const p = this.points[i];
+    if (!p || !p[which] || !isFinite(x) || !isFinite(y)) return;
+    this._record();
+    p[which] = { x, y };
+    this._mirrorHandle(p, which);
+    this._changed();
+  }
+
+  // Keep the opposite handle collinear (same length) while 'Sync handles' is on.
+  _mirrorHandle(p, which) {
+    if (p.smooth === false) return;
+    const h = p[which], other = which === 'in' ? 'out' : 'in';
+    const l = Math.hypot(h.x, h.y) || 1;
+    const lo = p[other] ? Math.hypot(p[other].x, p[other].y) : l;
+    p[other] = { x: -h.x / l * lo, y: -h.y / l * lo };
   }
 
   setSmooth(i = this.selected, smooth = true) {
@@ -538,7 +667,9 @@ export class ShapeEditor {
     return { x: this.sym.x ? Math.max(0, p.x) : p.x, y: this.sym.y ? Math.min(0, p.y) : p.y };
   }
 
-  _snapPoint(p, { grid = true, axis = true, guides = true } = {}) {
+  // clamp: false lets the result leave the editable half — a Bézier handle may reach across
+  // the mirror line (the curve itself is clipped to the region when the shape is built).
+  _snapPoint(p, { grid = true, axis = true, guides = true, clamp = true } = {}) {
     const t = this.snapMm;
     let x = p.x, y = p.y, sx = false, sy = false;
     if (guides) for (const g of this.guides) {
@@ -554,7 +685,7 @@ export class ShapeEditor {
       if (!sx) x = Math.round(x / g) * g;
       if (!sy) y = Math.round(y / g) * g;
     }
-    return this._clamp({ x, y });
+    return clamp ? this._clamp({ x, y }) : { x, y };
   }
 
   _snapBox(b) {
@@ -764,7 +895,7 @@ export class ShapeEditor {
         const now = performance.now(), key = `v${vi}`;
         if (this.lastTap.key === key && now - this.lastTap.t < 350) { this.lastTap = { t: 0, key: null }; this.deletePoint(vi); return; }
         this.lastTap = { t: now, key };
-        this._record(); this.drag = { kind: 'vertex', index: vi, moved: false }; this._setCursor('move');
+        this._record(); this.drag = { kind: 'vertex', index: vi, moved: false, p0: { x: this.points[vi].x, y: this.points[vi].y } }; this._setCursor('move');
         if (e.pointerType !== 'mouse') this._pressTimer = setTimeout(() => { this.drag = null; this.undoStack.pop(); this._openMenu(vi, e); }, LONG_PRESS);
         return;
       }
@@ -772,12 +903,12 @@ export class ShapeEditor {
       if (hit.kind === 'edge') {
         this._record(); this.points.splice(hit.edge.index, 0, this._snapPoint(hit.edge.point));
         this._select(hit.edge.index);
-        this.drag = { kind: 'vertex', index: hit.edge.index, moved: true }; this._setCursor('move'); this._changed(); return;
+        this.drag = { kind: 'vertex', index: hit.edge.index, moved: true, p0: { ...this.points[hit.edge.index] } }; this._setCursor('move'); this._changed(); return;
       }
       if (!this.inRegion(mm)) return;
       this._record(); this.points.push(this._snapPoint(mm));
       this._select(this.points.length - 1);
-      this.drag = { kind: 'vertex', index: this.points.length - 1, moved: true }; this._setCursor('move');
+      this.drag = { kind: 'vertex', index: this.points.length - 1, moved: true, p0: { ...this.points[this.points.length - 1] } }; this._setCursor('move');
       this._changed();
     } else if (this.tool === 'move') {
       if (rightClick) return;
@@ -865,19 +996,18 @@ export class ShapeEditor {
       this.onGuides(this.guides); this.dirty = true;
     } else if (d.kind === 'vertex') {
       const p = this.points[d.index];
-      const s = this._snapPoint(mm);
+      // Shift keeps the point on the horizontal or vertical line through where the drag started.
+      const lock = e.shiftKey && d.p0 ? (Math.abs(mm.x - d.p0.x) >= Math.abs(mm.y - d.p0.y) ? 'y' : 'x') : null;
+      const s = this._snapPoint(lock === 'y' ? { x: mm.x, y: d.p0.y } : lock === 'x' ? { x: d.p0.x, y: mm.y } : mm);
+      if (lock === 'y') s.y = d.p0.y; else if (lock === 'x') s.x = d.p0.x;   // the snap may not break the lock
       p.x = s.x; p.y = s.y; d.moved = true; this._changed();
     } else if (d.kind === 'handle') {
       const p = this.points[d.index];
-      const s = this._snapPoint(mm, { grid: false, axis: false, guides: false });
-      const h = { x: s.x - p.x, y: s.y - p.y };
+      const s = this._snapPoint(mm, { axis: false, guides: false, clamp: false });
+      let h = { x: s.x - p.x, y: s.y - p.y };
+      if (e.shiftKey) h = snapAngle45(h);   // Shift: horizontal, vertical or diagonal
       p[d.which] = h;
-      if (p.smooth !== false) {
-        const other = d.which === 'in' ? 'out' : 'in';
-        const l = Math.hypot(h.x, h.y) || 1;
-        const lo = p[other] ? Math.hypot(p[other].x, p[other].y) : l;
-        p[other] = { x: -h.x / l * lo, y: -h.y / l * lo };
-      }
+      this._mirrorHandle(p, d.which);
       this._changed();
     } else if (d.kind === 'move') {
       let dx = mm.x - d.p0.x, dy = mm.y - d.p0.y;
