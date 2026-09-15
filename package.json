@@ -1,0 +1,14 @@
+{
+  "name": "cutter",
+  "version": "1.0.0",
+  "description": "Draw a shape, download a 3D-printable cookie cutter (STL).",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node dev-server.js"
+  },
+  "dependencies": {
+    "clipper-lib": "^6.4.2",
+    "manifold-3d": "^3.0.1"
+  }
+}
