@@ -512,8 +512,12 @@ body {
    taller than the pane. app.js puts it under the button and keeps it inside the window. */
 .preset-menu {
   position: fixed; z-index: 12;
-  width: 276px; max-width: calc(100vw - 22.4px); overflow: auto;
-  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5.6px;
+  /* the grid is as wide as the columns it holds: two on a phone, one more per step up,
+     and never more than five — past that the tiles are small and the grid reads as a list */
+  --cols: 5; --tile: 84px;
+  width: min(calc(var(--cols) * (var(--tile) + 5.6px) - 5.6px + 16.8px), calc(100vw - 22.4px));
+  overflow: auto;
+  display: grid; grid-template-columns: repeat(var(--cols), minmax(0, 1fr)); gap: 5.6px;
   padding: 8.4px; border-radius: var(--radius-lg);
   background: var(--paper); box-shadow: var(--shadow-md);
 }
@@ -537,9 +541,18 @@ body {
 .preset-tile:focus-visible { outline: 2px solid var(--accent-light); outline-offset: 1px; }
 /* Phones: bigger tiles for thumbs, and enough height that the last row is not cut in half.
    This block has to come after the rules above, not with the other phone rules further up. */
+@media (max-width: 1180px) { .preset-menu { --cols: 4; } }
+@media (max-width: 900px) { .preset-menu { --cols: 3; } }
 @media (max-width: 760px) {
-  .preset-menu { width: min(324px, calc(100vw - 22.4px)); }
+  .preset-menu { --cols: 2; --tile: 130px; }
   .preset-tile { padding: 9px 4px 7px; }
+}
+
+/* the shape the size dialog is asking about, drawn the same way its tile is */
+.preset-figure { display: flex; justify-content: center; }
+.preset-figure svg { width: 92px; height: 92px; }
+.preset-figure path {
+  fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round;
 }
 
 /* ---------- canvas grid control (bottom left, where the scale bar used to be painted) ---------- */

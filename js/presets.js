@@ -1,4 +1,7 @@
-// Starter shapes, all roughly 70 mm across, in mm with y down.
+// Starter shapes, drawn at roughly 70 mm across, in mm with y down. They are inserted at
+// PRESET_SIZE_MM on their longest side — earring size — and the size dialog that follows the
+// tile can override that; the drawings below stay at their own scale so the fitted outlines
+// keep the deviations noted with them.
 //
 // Each one is the outline it has always been, but described the way the Points tool describes
 // a shape: a handful of anchors carrying Bézier handles (`in`/`out`, offsets from the anchor)
@@ -7,6 +10,10 @@
 // Where a shape used to be sampled from a formula, the curve is fitted to that same formula;
 // the worst deviation from the old outline is noted with the shape, and is far below the
 // 0.4 mm blade width.
+
+// What a starter shape measures on its longest side when it is inserted. Cutters for earrings
+// are the common case and they are small; the size dialog is right there for everything else.
+export const PRESET_SIZE_MM = 30;
 
 const TAU = Math.PI * 2;
 const K = 0.5522847498;              // handle length / radius for a quarter circle
@@ -32,8 +39,10 @@ const onArc = (cx, cy, r, a, hIn, hOut) => node(
 // A circular arc as `n` cubics — two of them hold a half circle to within 0.003 mm.
 // The first anchor has no incoming handle and the last none outgoing, so whatever comes
 // before or after joins with a straight line, exactly as the old sampled outlines did.
+// A sweep given backwards (a1 < a0) gets a negative handle length, which points the tangents
+// the way the walk goes — that is what a concave bite like the moon's is made of.
 function arcPts(cx, cy, r, a0, a1, n = 2) {
-  const step = (a1 - a0) / n, h = Math.abs(r * (4 / 3) * Math.tan(step / 4));
+  const step = (a1 - a0) / n, h = r * (4 / 3) * Math.tan(step / 4);
   return Array.from({ length: n + 1 }, (_, i) =>
     onArc(cx, cy, r, a0 + step * i, i > 0 ? h : 0, i < n ? h : 0));
 }
@@ -64,10 +73,13 @@ function turn(p, k) {
   return { x, y };
 }
 
-const circle = (cx, cy, r) => DIRS.map(([dx, dy], i) => {
+// Four anchors on the axes, handles along the tangent: the cheapest round outline there is.
+const ellipse = (cx, cy, rx, ry) => DIRS.map(([dx, dy], i) => {
   const [tx, ty] = DIRS[(i + 1) % 4];             // the tangent is a quarter turn ahead
-  return node(cx + r * dx, cy + r * dy, [-tx * K * r, -ty * K * r], [tx * K * r, ty * K * r]);
+  const h = [tx * K * rx, ty * K * ry];
+  return node(cx + rx * dx, cy + ry * dy, [-h[0], -h[1]], h);
 });
+const circle = (cx, cy, r) => ellipse(cx, cy, r, r);
 
 // The heart, fitted to  x = 33.6 sin³t,  y = −2.1 (13 cos t − 5 cos 2t − 2 cos 3t − cos 4t).
 // This is the right-hand half, walked from the notch down to the point at the bottom. Both
@@ -84,17 +96,146 @@ const HEART_HALF = [
 export const PRESETS = {
   circle: { label: 'Circle', make: () => circle(0, 0, 35) },
 
-  heart: {
-    label: 'Heart',
-    make: () => [...HEART_HALF, ...mirrored(HEART_HALF.slice(1, -1))],
+  oval: { label: 'Oval', make: () => ellipse(0, 0, 24, 35) },
+
+  egg: {
+    label: 'Egg',
+    // An oval with one end narrower: the same four anchors, the widest point pushed below the
+    // middle, and handles that reach further towards the round end than towards the point.
+    make: () => {
+      const rx = 24, top = -35, bot = 35, wide = 6;
+      const up = (wide - top) * 0.62, down = (bot - wide) * 0.58;
+      return [
+        node(0, top, [-15, 0], [15, 0]),
+        node(rx, wide, [0, -up], [0, down]),
+        node(0, bot, [20, 0], [-20, 0]),
+        node(-rx, wide, [0, down], [0, -up]),
+      ];
+    },
   },
 
-  star: {
-    label: 'Star',
-    make: () => Array.from({ length: 10 }, (_, i) => {
-      const a = (i / 10) * TAU - Math.PI / 2, r = i % 2 === 0 ? 36 : 17;
-      return { x: r * Math.cos(a), y: r * Math.sin(a) };
-    }),
+  teardrop: {
+    label: 'Teardrop',
+    // A circle with a point drawn out of the top of it. The tip is held at about 50°, not the
+    // 33° the handles first gave it: a sharper point than that is a sliver of clay that tears
+    // off the cut piece, and no blade this side of 0.4 mm can hold it anyway.
+    make: () => {
+      const r = 22, cy = 13, h = r * (4 / 3) * Math.tan(Math.PI / 8);
+      return [
+        corner(0, -35, [-6.8, 15], [6.8, 15]),
+        node(r, cy, [0, -22], [0, h]),
+        node(0, cy + r, [h, 0], [-h, 0]),
+        node(-r, cy, [0, h], [0, -22]),
+      ];
+    },
+  },
+
+  leaf: {
+    label: 'Leaf',
+    // Two anchors and nothing else — a tip at each end, handles bulging out to the sides.
+    // The tips come out at 90°, which is blunt enough to print and still reads as a point.
+    make: () => [
+      corner(0, -35, [-26, 26], [26, 26]),
+      corner(0, 35, [26, -26], [-26, -26]),
+    ],
+  },
+
+  pebble: {
+    label: 'Pebble',
+    // An outline with no symmetry to it: five anchors at uneven radii, each handle laid along
+    // the line between its two neighbours, which is what keeps the curve smooth instead of lumpy.
+    make: () => {
+      const P = [[-88, 34], [-8, 29], [62, 33], [148, 30], [212, 27]].map(([deg, r]) => {
+        const a = deg * Math.PI / 180;
+        return { x: r * Math.cos(a), y: r * Math.sin(a) * 1.05 };
+      });
+      return P.map((p, i) => {
+        const a = P[(i + P.length - 1) % P.length], b = P[(i + 1) % P.length];
+        const dx = b.x - a.x, dy = b.y - a.y, L = Math.hypot(dx, dy);
+        const back = Math.hypot(p.x - a.x, p.y - a.y) * 0.4, fwd = Math.hypot(b.x - p.x, b.y - p.y) * 0.4;
+        return node(p.x, p.y, [-dx / L * back, -dy / L * back], [dx / L * fwd, dy / L * fwd]);
+      });
+    },
+  },
+
+  halfCircle: {
+    label: 'Half circle',
+    // Three anchors: the half circle as two cubics, closed by the straight edge across the top.
+    make: () => {
+      const r = 33, h = r * (4 / 3) * Math.tan(Math.PI / 8);
+      return [corner(r, 0, null, [0, h]), node(0, r, [h, 0], [-h, 0]), corner(-r, 0, [0, h], null)];
+    },
+  },
+
+  arch: {
+    label: 'Arch',
+    // Flat bottom, straight sides, a half circle on top.
+    make: () => {
+      const r = 22, spring = -11, bot = 33, h = r * (4 / 3) * Math.tan(Math.PI / 8);
+      return [
+        corner(-r, bot),
+        corner(-r, spring, null, [0, -h]),
+        node(0, spring - r, [-h, 0], [h, 0]),
+        corner(r, spring, [0, -h], null),
+        corner(r, bot),
+      ];
+    },
+  },
+
+  bar: {
+    label: 'Rounded bar',
+    // Two straight sides closed by a half circle at each end.
+    make: () => {
+      const r = 20, side = 15, h = r * (4 / 3) * Math.tan(Math.PI / 8);
+      return [
+        corner(r, -side, [0, -h], null),
+        corner(r, side, null, [0, h]),
+        node(0, side + r, [h, 0], [-h, 0]),
+        corner(-r, side, [0, h], null),
+        corner(-r, -side, null, [0, -h]),
+        node(0, -side - r, [-h, 0], [h, 0]),
+      ];
+    },
+  },
+
+  rainbow: {
+    label: 'Rainbow',
+    // A band: the arc over the top, then the same arc walked back inside it, the two joined
+    // by a straight end. The inner sweep runs backwards, which is what the signed arcPts is for.
+    make: () => [...arcPts(0, 0, 35, Math.PI, TAU), ...arcPts(0, 0, 17, TAU, Math.PI)],
+  },
+
+  moon: {
+    label: 'Moon',
+    // A circle with a bite taken out of it. The horns are where the two circles cross: one
+    // anchor each, carrying the outer arc's tangent on one side and the bite's on the other,
+    // which is why they are the one place in here that must not be smooth.
+    make: () => {
+      const R = 35, r = 31, d = 20;                      // the circle, the bite, how far off-centre
+      const x = (d * d + R * R - r * r) / (2 * d), y = Math.sqrt(R * R - x * x);
+      const a = Math.atan2(y, x), b = Math.atan2(y, x - d);
+      const outer = arcPts(0, 0, R, a, TAU - a, 3);      // the long way round, through 180°
+      const bite = arcPts(d, 0, r, TAU - b, b);          // backwards, so it curves inward
+      outer[outer.length - 1].out = bite[0].out;
+      outer[0].in = bite[bite.length - 1].in;
+      outer[0].smooth = outer[outer.length - 1].smooth = false;
+      return [...outer, bite[1]];
+    },
+  },
+
+  shield: {
+    label: 'Shield',
+    // A tag: straight top edge, rounded top corners, sides drawn down to a point.
+    make: () => {
+      const w = 24, top = -32, rad = 9, h = K * rad;
+      return [
+        corner(-w + rad, top, [-h, 0], null),
+        corner(w - rad, top, null, [h, 0]),
+        node(w, top + rad, [0, -h], [0, 20]),
+        node(0, 35, [16, -16], [-16, -16], false),       // the point at the bottom
+        node(-w, top + rad, [0, 20], [0, -h]),
+      ];
+    },
   },
 
   roundedSquare: {
@@ -109,6 +250,61 @@ export const PRESETS = {
       }
       return pts;
     },
+  },
+
+  roundedTriangle: {
+    label: 'Rounded triangle',
+    // Straight sides with a generous fillet at each corner: the two tangent points sit `t`
+    // back from the corner and the 120° turn between them is a single cubic.
+    make: () => {
+      const R = 52, rad = 13, t = rad / Math.tan(Math.PI / 6), h = rad * (4 / 3) * Math.tan(Math.PI / 6);
+      const V = [0, 1, 2].map(i => {
+        const a = (i / 3) * TAU - Math.PI / 2;
+        return { x: R * Math.cos(a), y: R * Math.sin(a) };
+      });
+      const unit = (from, to) => {
+        const dx = to.x - from.x, dy = to.y - from.y, L = Math.hypot(dx, dy);
+        return { x: dx / L, y: dy / L };
+      };
+      const pts = [];
+      for (let i = 0; i < 3; i++) {
+        const v = V[i], back = unit(v, V[(i + 2) % 3]), on = unit(v, V[(i + 1) % 3]);
+        pts.push(corner(v.x + back.x * t, v.y + back.y * t, null, [-back.x * h, -back.y * h]));
+        pts.push(corner(v.x + on.x * t, v.y + on.y * t, [-on.x * h, -on.y * h], null));
+      }
+      return pts;
+    },
+  },
+
+  hexagon: {
+    label: 'Hexagon',
+    make: () => Array.from({ length: 6 }, (_, i) => {
+      const a = (i / 6) * TAU - Math.PI / 2;
+      return { x: 32 * Math.cos(a), y: 35 * Math.sin(a) };
+    }),
+  },
+
+  diamond: {
+    label: 'Diamond',
+    make: () => [{ x: 0, y: -35 }, { x: 23, y: 0 }, { x: 0, y: 35 }, { x: -23, y: 0 }],
+  },
+
+  trapezoid: {
+    label: 'Trapezoid',
+    make: () => [{ x: -13, y: -30 }, { x: 13, y: -30 }, { x: 23, y: 30 }, { x: -23, y: 30 }],
+  },
+
+  star: {
+    label: 'Star',
+    make: () => Array.from({ length: 10 }, (_, i) => {
+      const a = (i / 10) * TAU - Math.PI / 2, r = i % 2 === 0 ? 36 : 17;
+      return { x: r * Math.cos(a), y: r * Math.sin(a) };
+    }),
+  },
+
+  heart: {
+    label: 'Heart',
+    make: () => [...HEART_HALF, ...mirrored(HEART_HALF.slice(1, -1))],
   },
 
   flower: {

@@ -1,7 +1,8 @@
 import { ShapeEditor, flatten, mapPts } from './editor.js';
 import { CutterViewer } from './viewer.js';
 import { importSVG } from './svgimport.js';
-import { PRESETS } from './presets.js';
+import { importSTL } from './stlimport.js';
+import { PRESETS, PRESET_SIZE_MM } from './presets.js';
 import { packProject, unpackProject, PROJECT_EXT } from './project.js';
 import { buildCutter, toBinarySTL, offsetPolygon, cleanPolygon, bounds, bridgeShapes, signedArea,
          unionPolygons, loadManifold, manifoldReady, DEFAULT_PARAMS } from './geometry.js';
@@ -99,7 +100,7 @@ function updateHint(shape) {
     hint.classList.add('corner'); hint.hidden = false;
   } else if (shape.outer.length < 1) {
     hint.classList.remove('corner');
-    text.innerHTML = '<strong>Draw the shape to cut.</strong> Drag to sketch — the outline closes and smooths itself. Or place corners one by one with <em>Points</em>, upload an SVG, or pick a starter shape.';
+    text.innerHTML = '<strong>Draw the shape to cut.</strong> Drag to sketch — the outline closes and smooths itself. Or place corners one by one with <em>Points</em>, pick a starter shape, or upload an SVG — or an STL of a cutter you made before.';
     hint.hidden = false;
   } else hint.hidden = true;
 }
@@ -265,7 +266,52 @@ function checkAgainstSaved() {
   if (!pendingCheck || !result) return;
   const saved = pendingCheck; pendingCheck = null;
   const off = Math.max(Math.abs(saved.width - result.footprint.width), Math.abs(saved.height - result.footprint.height));
-  if (off > 0.05) toast('Opened, but this cutter comes out slightly different from when it was saved.');
+  if (off > 0.05) toast(saved.warning || 'Opened, but this cutter comes out slightly different from when it was saved.');
+}
+
+// ---------- opening an STL ----------
+// For cutters made before there were project files. A cutter is a stack of prisms, so a cut
+// through it hands the outline straight back, and the walls, the steps and the connections are
+// measured off the same sections (js/stlimport.js). What an STL cannot hold is how the drawing
+// was made: curves come back as the outline they were flattened to, and symmetry is gone.
+async function openSTL(file) {
+  let res;
+  try {
+    res = importSTL(await file.arrayBuffer());
+  } catch (e) {
+    toast(e.message || 'Could not read that STL.');
+    return;
+  }
+  if (editor.hasOuter) {
+    const ok = await confirmAction('Open this STL?',
+      'What is on the canvas now is replaced by the shape and the settings read out of the model. This cannot be undone.', 'Open');
+    if (!ok) return;
+  }
+  applyState({
+    ...editor.getState(), // the grid, the smoothing and the aspect lock are yours, not the file's
+    shape: res.shape,
+    sym: { x: false, y: false }, // an STL holds the whole outline, never a half to mirror
+    active: 'outer',
+    tool: 'move',
+    params: res.params,
+    bridgeAuto: false,
+    name: file.name.replace(/\.stl$/i, '').replace(/[^\w\-]+/g, '-') || 'cutter',
+    // the same check a project gets: rebuild it and say so if the result is not that model
+    stats: { ...res.footprint, warning: 'Opened, but the cutter this builds comes out slightly different from the STL. Check the wall settings.' },
+  });
+  toast(describeSTL(file.name, res));
+}
+
+function describeSTL(name, res) {
+  const p = res.params;
+  const bits = [`${res.size.width.toFixed(1)} × ${res.size.height.toFixed(1)} mm`, `${p.height} mm tall`];
+  if (!res.outlineOnly) {
+    bits.push(`${p.bladeWidth} mm blade`);
+    if (p.baseHeight > 0) bits.push(`${p.baseWidth} mm base`);
+    if (p.ridge) bits.push('support step');
+    if (res.shape.inner.length >= 3) bits.push(`${p.bridgeCount} connection${p.bridgeCount === 1 ? '' : 's'}`);
+  }
+  return `Rebuilt from ${name} — ${bits.join(', ')}.` + (res.notes.length ? ' ' + res.notes.join(' ') : '');
 }
 
 $('saveProjectBtn').addEventListener('click', saveProject);
@@ -275,7 +321,7 @@ $('openProjectBtn').addEventListener('click', pickProject);
 $('openProjectBtn2').addEventListener('click', pickProject);
 $('projectInput').addEventListener('change', (e) => {
   const file = e.target.files?.[0]; e.target.value = '';
-  if (file) openProject(file);
+  if (file) (isSTL(file) ? openSTL : openProject)(file);
 });
 setSaveEnabled(false);
 
@@ -523,6 +569,24 @@ function drawProfile() {
   `;
 }
 
+// Two size boxes tied together by a proportion lock. The SVG import and the starter shapes
+// both ask for a size before anything lands on the canvas, and both mean the same by it.
+// The returned object carries the ratio (height / width) the caller has to keep up to date.
+function linkSizeFields(wId, hId, lockId) {
+  const state = { ratio: 1, lock: true };
+  $(lockId).addEventListener('click', () => {
+    state.lock = !state.lock;
+    $(lockId).setAttribute('aria-pressed', String(state.lock));
+  });
+  const follow = (from, to, f) => $(from).addEventListener('input', () => {
+    const v = parseFloat($(from).value);
+    if (state.lock && state.ratio > 0 && v > 0) $(to).value = f(v).toFixed(1);
+  });
+  follow(wId, hId, (w) => w * state.ratio);
+  follow(hId, wId, (h) => h / state.ratio);
+  return state;
+}
+
 // ---------- starter shapes ----------
 // A drop-down could only list the names, so the button opens a grid of previews. Each tile is
 // drawn from the very same anchors the editor is handed, so a picture here cannot drift away
@@ -543,33 +607,81 @@ function presetPath(pts) {
   return `${d}Z`;
 }
 
-function applyPreset(key) {
+// The viewBox that frames an outline with a little air around it, so the tile in the grid and
+// the picture in the size dialog are the same drawing.
+function presetArt(pts) {
+  const b = bounds(flatten(pts)), box = Math.max(b.width, b.height) * 1.12, v = (n) => Math.round(n * 100) / 100;
+  return { viewBox: `${v(b.cx - box / 2)} ${v(b.cy - box / 2)} ${v(box)} ${v(box)}`, d: presetPath(pts), b };
+}
+
+// Insert the shape at the size the dialog settled on. The anchors are drawn at their own scale
+// (see presets.js), so this is where they are brought to millimetres; mapPts takes the handles
+// along with their anchors.
+function insertPreset(key, w, h) {
   const p = PRESETS[key]; if (!p) return;
   // The shapes are drawn with Bézier handles, so they go in as they are: cleaning them
   // through Clipper would flatten every curve into a polyline of hundreds of points.
-  const pts = p.make();
+  const pts = p.make(), b = bounds(flatten(pts));
+  const sx = w / b.width, sy = h / b.height;
+  const at = (cx, cy) => mapPts(pts, q => ({ x: cx + (q.x - b.cx) * sx, y: cy + (q.y - b.cy) * sy }));
   if (editor.active === 'inner') {
-    // scale the shape to fit inside the outer wall (bounds of the curve, not of the handles)
-    const ob = editor.getSize(), pb = bounds(flatten(pts));
-    const s = Math.min(ob.width, ob.height) * 0.5 / Math.max(pb.width, pb.height) || 1;
-    const c = bounds(editor.getPoints());
-    editor.setPoints(mapPts(pts, q => ({ x: c.cx + (q.x - pb.cx) * s, y: c.cy + (q.y - pb.cy) * s })), { record: true });
+    // centred on the outer wall, so the hole lands inside it
+    const c = editor.hasOuter ? bounds(editor.getPoints()) : { cx: 0, cy: 0 };
+    editor.setPoints(at(c.cx, c.cy), { record: true });
   } else {
-    editor.setShape({ outer: pts, inner: [] }, { record: true, center: true });
+    editor.setShape({ outer: at(0, 0), inner: [] }, { record: true, center: true });
   }
   setTool('move');
 }
 
+// Picking a tile asks for the size first: a starter shape is a starting point for a cutter of
+// a particular size, and 70 mm of circle is not what anyone making earrings is after.
+let pendingPreset = null;
+function askPresetSize(key) {
+  const p = PRESETS[key]; if (!p) return;
+  const art = presetArt(p.make()), b = art.b;
+  const inner = editor.active === 'inner' && editor.hasOuter;
+  let w, h;
+  if (inner) {                                       // half the outer wall, the way it used to land
+    const o = editor.getSize(), s = Math.min(o.width, o.height) * 0.5 / Math.max(b.width, b.height) || 1;
+    w = b.width * s; h = b.height * s;
+  } else {
+    const s = PRESET_SIZE_MM / Math.max(b.width, b.height);
+    w = b.width * s; h = b.height * s;
+  }
+  pendingPreset = { key, w, h };
+  presetSize.ratio = b.height / b.width;
+  $('presetPreview').setAttribute('viewBox', art.viewBox);
+  $('presetPreviewPath').setAttribute('d', art.d);
+  $('presetDialogNote').textContent = inner
+    ? `${p.label}, sized to sit inside the outer wall. Change it if you want.`
+    : `${p.label}, at the size cutters for earrings usually are. Change it if you want — the size boxes under the canvas can do it later too.`;
+  $('presetWidth').value = w.toFixed(1); $('presetHeight').value = h.toFixed(1);
+  $('presetDialog').showModal();
+  $('presetWidth').focus(); $('presetWidth').select();
+}
+
+const presetSize = linkSizeFields('presetWidth', 'presetHeight', 'presetLockBtn');
+$('presetCancelBtn').addEventListener('click', () => $('presetDialog').close());
+$('presetDialog').addEventListener('close', () => { pendingPreset = null; });
+$('presetDialog').addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (!pendingPreset) return;
+  const { key, w, h } = pendingPreset;
+  const mm = (v, fallback) => { const n = parseFloat(v); return n > 0 && n <= 400 ? n : fallback; };
+  const width = mm($('presetWidth').value, w), height = mm($('presetHeight').value, h);
+  $('presetDialog').close();
+  insertPreset(key, width, height);
+});
+
 for (const [key, p] of Object.entries(PRESETS)) {
-  const pts = p.make(), b = bounds(flatten(pts));
-  const box = Math.max(b.width, b.height) * 1.12;   // a square with a little air around the outline
-  const v = (n) => Math.round(n * 100) / 100;
+  const art = presetArt(p.make());
   const tile = document.createElement('button');
   tile.type = 'button';
   tile.className = 'preset-tile';
   tile.dataset.preset = key;
-  tile.innerHTML = `<svg viewBox="${v(b.cx - box / 2)} ${v(b.cy - box / 2)} ${v(box)} ${v(box)}" aria-hidden="true">`
-    + `<path d="${presetPath(pts)}" vector-effect="non-scaling-stroke" /></svg><span></span>`;
+  tile.innerHTML = `<svg viewBox="${art.viewBox}" aria-hidden="true">`
+    + `<path d="${art.d}" vector-effect="non-scaling-stroke" /></svg><span></span>`;
   tile.querySelector('span').textContent = p.label;
   presetMenu.append(tile);
 }
@@ -607,7 +719,7 @@ presetMenu.addEventListener('click', (e) => {
   const tile = e.target.closest('[data-preset]');
   if (!tile) return;
   setPresetMenu(false);
-  applyPreset(tile.dataset.preset);
+  askPresetSize(tile.dataset.preset);
 });
 document.addEventListener('pointerdown', (e) => {
   if (!presetMenu.hidden && !e.target.closest('.preset-picker')) setPresetMenu(false);
@@ -621,11 +733,14 @@ window.addEventListener('scroll', (e) => {
   if (!presetMenu.hidden && !presetMenu.contains(e.target)) placePresetMenu();
 }, true);
 
-// ---------- SVG upload (with a size dialog) ----------
+// ---------- upload (SVG outline, or a whole cutter from an STL) ----------
+const isSTL = (file) => /\.stl$/i.test(file.name) || file.type === 'model/stl';
+
 let pendingSvg = null;
 $('svgInput').addEventListener('change', async (e) => {
   const file = e.target.files?.[0]; e.target.value = '';
   if (!file) return;
+  if (isSTL(file)) { openSTL(file); return; }
   try {
     const text = await file.text();
     const res = await importSVG(text);
@@ -633,7 +748,7 @@ $('svgInput').addEventListener('change', async (e) => {
     const b = bounds(res.points);
     let w = b.width, h = b.height;
     if (!res.physical || Math.max(w, h) > 400 || Math.max(w, h) < 5) { const s = 80 / Math.max(w, h); w *= s; h *= s; }
-    pendingSvg.ratio = b.height / b.width;
+    svgSize.ratio = b.height / b.width;
     $('svgWidth').value = w.toFixed(1); $('svgHeight').value = h.toFixed(1);
     $('svgDialogNote').textContent = res.physical
       ? `${file.name} specifies a physical size (${b.width.toFixed(1)} × ${b.height.toFixed(1)} mm). Change it if needed.`
@@ -645,10 +760,7 @@ $('svgInput').addEventListener('change', async (e) => {
     toast(err.message || 'Could not read that SVG.');
   }
 });
-let svgLock = true;
-$('svgLockBtn').addEventListener('click', () => { svgLock = !svgLock; $('svgLockBtn').setAttribute('aria-pressed', String(svgLock)); });
-$('svgWidth').addEventListener('input', () => { if (svgLock && pendingSvg) { const w = parseFloat($('svgWidth').value); if (w > 0) $('svgHeight').value = (w * pendingSvg.ratio).toFixed(1); } });
-$('svgHeight').addEventListener('input', () => { if (svgLock && pendingSvg) { const h = parseFloat($('svgHeight').value); if (h > 0) $('svgWidth').value = (h / pendingSvg.ratio).toFixed(1); } });
+const svgSize = linkSizeFields('svgWidth', 'svgHeight', 'svgLockBtn');
 $('svgCancelBtn').addEventListener('click', () => { pendingSvg = null; $('svgDialog').close(); });
 $('svgDialog').addEventListener('submit', (e) => {
   e.preventDefault();

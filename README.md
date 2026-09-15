@@ -18,13 +18,18 @@ no accounts — everything runs in the browser.
   which you can type over.
 - **Move & resize**: drag the shape, corner/edge handles to resize, top knob to rotate
   (snaps to 15°), two-finger pinch/twist on touch screens.
-- **Upload SVG**: any SVG with paths or basic shapes. A dialog asks for the size (prefilled
-  from the SVG's physical units, or 80 mm wide). Multiple shapes are merged; a hole becomes the inner wall.
-- **Starter shapes**: circle, heart, star, rounded square, flower, gingerbread man, tree —
-  picked from a grid of previews, so you can see each one before you insert it.
-  They arrive as a handful of points with curve handles (a circle is four points, the gingerbread
-  man twenty), so you can reshape one with the *Points* tool instead of pushing hundreds of dots
-  around. The outlines themselves are unchanged.
+- **Upload**: an SVG with paths or basic shapes, or an STL of a cutter. For an SVG a dialog asks
+  for the size (prefilled from the SVG's physical units, or 80 mm wide); multiple shapes are
+  merged and a hole becomes the inner wall. An STL is read back as a whole cutter — see
+  *Opening an STL* below.
+- **Starter shapes**: twenty-two outlines, picked from a grid of previews so you can see each
+  one before you insert it. Round ones (circle, oval, egg, teardrop, leaf, pebble), arches and
+  bands (half circle, arch, rounded bar, rainbow, moon, shield), straight-sided ones (rounded
+  square, rounded triangle, hexagon, diamond, trapezoid) and figures (star, heart, flower,
+  gingerbread man, Christmas tree). Picking one asks how big it should be, prefilled at 30 mm —
+  earring size — which you can type over; the size boxes under the canvas can still change it later.
+  They arrive as a handful of points with curve handles (a leaf is two points, a circle four),
+  so you can reshape one with the *Points* tool instead of pushing hundreds of dots around.
 - **Inner wall**: switch *Editing* to "Inner wall" and draw a hole (or upload an SVG that has one).
   The area between the walls is what gets cut. Bars at base level connect the inner wall to
   the outer wall so it keeps its position; count, thickness (auto = 10% of the width) and
@@ -76,6 +81,16 @@ no accounts — everything runs in the browser.
   rename it to `.zip` and you will find `project.json`, the `model.stl` as downloaded, and a
   picture of the drawing and of the 3D view. Only `project.json` is read back; the mesh is
   rebuilt from it.
+- **Opening an STL**: an STL of a cutter — one of yours from before project files existed, or one
+  made elsewhere — can be opened with *Open project* or with *Upload*, and comes back as a
+  drawing with its settings. A cutter is a stack of straight-walled tiers, so a horizontal cut
+  through the model hands the outline straight back: the cut line is read halfway up the blade,
+  the heights come from the tiers, the wall widths from how far each tier stands out from the cut
+  line, and the connection bars from what crosses the channel at base level. You get the same
+  cutter, and can now change it. Two things an STL cannot hold: curve handles (the outline comes
+  back as the points it was flattened to) and symmetry (the whole outline comes back, not a half
+  to mirror). Anything that is not a cutter — a solid with no blade — gives its outline at the
+  top and leaves the wall settings alone, and says so.
 
 ## Run locally
 
@@ -114,10 +129,11 @@ steps. `CLAUDE.md`, `GEMINI.md`, `.cursor/rules` and `.github/copilot-instructio
 ```
 index.html          page + settings panel
 styles.css          layout & theme (responsive: desktop / tablet / phone)
-js/app.js           wiring: UI, live regeneration, STL download, save/open project
+js/app.js           wiring: UI, live regeneration, STL download, save/open project, STL import
 js/editor.js        2D canvas editor (draw / points / move & resize, undo, gestures)
 js/geometry.js      polygon clean-up, offsetting, mesh building, STL writer
 js/svgimport.js     SVG → outline (uses the browser's own path engine)
+js/stlimport.js     STL → the outline and the settings that built it (slices the mesh)
 js/viewer.js        three.js preview
 js/presets.js       starter shapes
 js/project.js       .cutter project file: what is saved, and reading it back
@@ -125,6 +141,7 @@ js/zip.js           tiny zip reader/writer for the project file
 vendor/             three.js (+ OrbitControls), clipper-lib and manifold-3d (WebAssembly), vendored
 tests/mesh-check.mjs mesh integrity test: node tests/mesh-check.mjs 100
 tests/project-roundtrip.mjs  save → open → same mesh: node tests/project-roundtrip.mjs
+tests/stl-import.mjs  STL → drawing → same solid: node tests/stl-import.mjs 40
 dev-server.js       zero-dependency static server for local testing
 ```
 

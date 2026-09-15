@@ -220,6 +220,13 @@ export function clipToRegion(pts, sym) {
   return out;
 }
 
+// Intersection of two polygon sets given in mm. A ring wound the other way is a hole, so
+// [outline, hole] describes a region with a hole in it. Used by the STL importer to lift the
+// connection bars out of a cross-section.
+export function intersectPolygons(a, b) {
+  return interI(a.map(toClip), b.map(toClip)).map(fromClip);
+}
+
 // Does polygon `a` sit entirely inside polygon `b`?
 export function isInside(a, b) {
   const rest = diffI([toClip(a)], [toClip(b)]);
@@ -250,7 +257,8 @@ export const manifoldReady = () => !!M;
 
 const OV = 0.02; // mm of deliberate overlap between stacked tiers
 const SEGMENTS = 64; // segments per full circle for rounded offset corners
-const FAT = 0.005;   // mm added to every offset so a self-touching offset outline overlaps instead of pinching
+export const FAT = 0.005; // mm added to every offset so a self-touching offset outline overlaps instead of pinching
+                          // (exported so the STL importer can take it back off a measured wall)
 
 export const DEFAULT_PARAMS = {
   height: 15,        // total cutter height (mm)

@@ -42,9 +42,9 @@
       <span class="ready" id="readyNote">No shape yet</span>
       <div class="pair">
         <button class="btn icon" id="saveProjectBtn" title="Save project — keep this drawing and all its settings as a .cutter file, with the STL and previews inside. Open it later to carry on exactly where you left off." disabled><i class="ph ph-floppy-disk"></i></button>
-        <button class="btn icon" id="openProjectBtn" title="Open project — load a .cutter file you saved earlier. It replaces what is on the canvas."><i class="ph ph-folder-open"></i></button>
+        <button class="btn icon" id="openProjectBtn" title="Open project — load a .cutter file you saved earlier, or an STL from before project files existed. It replaces what is on the canvas."><i class="ph ph-folder-open"></i></button>
       </div>
-      <input type="file" id="projectInput" accept=".cutter,application/zip" hidden />
+      <input type="file" id="projectInput" accept=".cutter,application/zip,.stl,model/stl" hidden />
       <button class="btn primary" id="downloadBtn" disabled><i class="ph ph-download-simple"></i>Download STL</button>
     </div>
   </header>
@@ -60,9 +60,9 @@
         </div>
         <span class="spacer"></span>
         <div class="toolbar-group">
-          <label class="btn ghost file">
-            <i class="ph ph-upload-simple"></i>Upload SVG
-            <input type="file" id="svgInput" accept=".svg,image/svg+xml" hidden />
+          <label class="btn ghost file" title="Upload — bring in an outline from an SVG, or rebuild a whole cutter from an STL you made earlier. It replaces what you have drawn.">
+            <i class="ph ph-upload-simple"></i>Upload
+            <input type="file" id="svgInput" accept=".svg,image/svg+xml,.stl,model/stl" hidden />
           </label>
           <div class="preset-picker">
             <button class="btn ghost" id="presetBtn" aria-haspopup="true" aria-expanded="false" aria-controls="presetMenu"
@@ -329,7 +329,7 @@
             <button class="btn" type="button" id="saveProjectBtn2" disabled><i class="ph ph-floppy-disk"></i>Save project</button>
             <button class="btn" type="button" id="openProjectBtn2"><i class="ph ph-folder-open"></i>Open project</button>
           </div>
-          <p class="note"><span>A project file keeps the drawing and every setting, plus the STL and two pictures. Open it later and you get exactly the same cutter back.</span></p>
+          <p class="note"><span>A project file keeps the drawing and every setting, plus the STL and two pictures. Open it later and you get exactly the same cutter back. An STL from before there were project files can be opened too — the outline and the settings are read back out of the model.</span></p>
         </div>
       </div>
     </aside>
@@ -372,6 +372,27 @@
       <div class="dialog-actions">
         <button type="button" class="btn ghost" id="svgCancelBtn">Cancel</button>
         <button type="submit" class="btn primary" id="svgImportBtn"><i class="ph ph-check"></i>Import</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Picking a starter shape asks how big it should be before anything lands on the canvas:
+       a cutter for earrings is a small thing, and the shape has to be resized either way. -->
+  <dialog class="dialog" id="presetDialog">
+    <form method="dialog">
+      <h3><i class="ph ph-shapes"></i>Size of the shape</h3>
+      <div class="preset-figure"><svg id="presetPreview" aria-hidden="true"><path id="presetPreviewPath" vector-effect="non-scaling-stroke" /></svg></div>
+      <p class="note" id="presetDialogNote"></p>
+      <div class="field-row">
+        <label class="field"><span>Width</span><span class="unit"><input type="number" id="presetWidth" min="1" max="400" step="any" inputmode="decimal" required /><em>mm</em></span></label>
+        <button type="button" class="lock" id="presetLockBtn" aria-pressed="true" title="Keep proportions — changing one size changes the other along with it.">
+          <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><path class="shackle" d="M6 9V6.5a4 4 0 0 1 8 0V9" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="4" y="9" width="12" height="8" rx="1.5" fill="currentColor"/></svg>
+        </button>
+        <label class="field"><span>Height</span><span class="unit"><input type="number" id="presetHeight" min="1" max="400" step="any" inputmode="decimal" required /><em>mm</em></span></label>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="btn ghost" id="presetCancelBtn">Cancel</button>
+        <button type="submit" class="btn primary" id="presetInsertBtn"><i class="ph ph-check"></i>Insert</button>
       </div>
     </form>
   </dialog>

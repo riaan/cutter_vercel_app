@@ -27,18 +27,20 @@ Never call it a "cookie cutter" in the UI — it is just a "cutter"; the piece i
 index.html           page structure, all controls (ids are referenced from js/app.js)
 styles.css           tokens + responsive layout (desktop ≥1181px, tablet ≤1180px, phone ≤760px)
 js/app.js            wiring: UI ↔ editor ↔ geometry ↔ viewer; SVG dialog; starter-shape picker;
-                     point bar/menu; download; save/open project; cut-piece popup
+                     point bar/menu; download; save/open project; STL import; cut-piece popup
 js/project.js        .cutter project file: the saved state, validation, zip packing
 js/zip.js            minimal stored-only zip writer + reader (no dependency)
 js/editor.js         2D canvas editor (ShapeEditor class) — everything the user draws/edits
 js/geometry.js       math: polygon cleanup/offsets (Clipper), symmetry, solid build (Manifold), STL
 js/svgimport.js      SVG → outline(s) using the browser's own path engine
+js/stlimport.js      STL → the outline and the settings that built it, by slicing the mesh
 js/viewer.js         three.js preview (CutterViewer class)
 js/presets.js        starter shapes (few anchors + Bézier handles, see §6)
 vendor/              three.module.js (+ addons/controls/OrbitControls.js), clipper.js,
                      manifold.js + manifold.wasm — vendored; no CDN, no npm at runtime
 tests/mesh-check.mjs mesh integrity test (Node) — see §8
 tests/project-roundtrip.mjs  save → open → identical mesh (Node) — see §8
+tests/stl-import.mjs STL → drawing + settings → the same solid (Node) — see §8
 dev-server.js        static server for local testing (sets application/wasm for .wasm)
 vercel.json          only cache headers for vendor/
 package.json         "type": "module"; script `dev`; NO runtime dependencies
@@ -150,6 +152,37 @@ renderer does not preserve its drawing buffer); `editor.renderPreview()` draws t
 bands only — no grid, guides, handles or dimensions. Both may fail; the project then saves without
 that picture rather than not at all.
 
+### Reading an STL back (`js/stlimport.js`)
+The inverse of `buildCutter`, for cutters made before there were project files. Nothing is guessed
+from the triangles: every number is read off a horizontal section, which is exact because every
+wall is a vertical prism.
+- **the tiers** are the z of the horizontal faces that carry real area (`MIN_FACE_AREA`, 0.5 mm²,
+  merged within `LEVEL_MERGE` = 0.05 mm so the 0.02 mm tier overlap cannot show up as a level);
+- **the section** at the middle of a tier is chained out of the triangle/plane segments
+  (`sliceRings`) into contours with a nesting depth. Halfway up the blade, depth 1 is the cut line
+  — exactly the polygon `buildCutter` was handed, because the blade body has a prism of that very
+  polygon subtracted out of it — and depth 2 is the inner wall. Every wall face is two triangles,
+  so each contour carries a seam point in the middle of each face; 0.001 mm of RDP takes those out
+  (including the one at the start of the contour, which RDP is otherwise forced to keep);
+- **the widths** are the distance from the cut line out to that tier's outer edge, less `FAT`.
+  Read at the 2nd percentile of points taken evenly *along* the outline: an offset never runs
+  closer than its width but does run wider (a notch pinches, a reflex corner spikes), and sampling
+  at the corners instead would let a star answer with its notches;
+- **the bars** are what is left of the base section inside the channel between the two cut lines,
+  held back `CHANNEL_BACK` = 0.05 mm from both. Without that hold-back the boolean has to cut along
+  an edge it already shares and leaves spikes on the bars, which throws their width off. Each bar's
+  thickness is the narrowest span of its convex hull, and its direction is the one that span is
+  measured across — not the direction of its centroid, which a degree of error turns into
+  millimetres of width;
+- **Mirror comes back off** and the drawing is the y-flip of the model. Both settings make the
+  same solid out of mirrored drawings, so there is nothing in the file to tell them apart; off is
+  the reading whose top view *is* this STL.
+What cannot come back: Bézier handles (the file holds the flattened outline) and symmetry (it
+holds the whole outline, not a half). A solid with no ring at the top is not a cutter: its
+silhouette is taken, the wall settings are left alone and `outlineOnly` says so.
+`app.js › openSTL()` feeds the result through the same `applyState()` a project uses, including
+the footprint check — which here is a real verification, since the saved size is the STL's own.
+
 ### Resolution / smoothing
 - SVG import samples every 0.05 mm of the SVG's native size (max 6000 samples per element) and
   only de-duplicates (`cleanPolygon(…, 0.0005)`). Simplification happens **at the final size**
@@ -206,13 +239,25 @@ bars (`bridgeShapes`, Clipper) for the canvas. It is cached per editor version +
   scale bar), guides (vertical/horizontal, draggable tabs
   at the canvas edge, double-tap tab to remove), mirror lines. Magnet distance `SNAP_PX = 10`.
   Freehand strokes are deliberately **not** grid-snapped (would make them jagged).
-- **Starter shapes** open a grid of previews (`#presetBtn` → `#presetMenu`), three columns, one
-  tile per shape. `app.js` builds the tiles from `PRESETS[key].make()` itself — the same anchors
+- **Starter shapes** open a grid of previews (`#presetBtn` → `#presetMenu`): two columns on a
+  phone, three, four and five as the window gets wider (`--cols` / `--tile` per breakpoint in
+  `styles.css`), one tile per shape. Picking one opens `#presetDialog`, which asks for the size
+  before anything lands on the canvas — prefilled at `PRESET_SIZE_MM` (30 mm) on the longest side,
+  or at half the outer wall when the inner wall is the one being edited. Its width/height boxes
+  share `linkSizeFields()` with the SVG import dialog. `app.js` builds the tiles from `PRESETS[key].make()` itself — the same anchors
   the editor is handed, turned into an SVG path — so a preview can never drift from the outline it
   inserts; adding a preset needs no picture. The grid is `position: fixed` and placed by
   `placePresetMenu()`, because `.pane-draw` clips what overflows it and on a phone the grid is
   taller than the pane; it flips above the button when there is more room there. The button's own
-  tooltip is taken away while the grid is open, or it would cover it.
+  tooltip is taken away while the grid is open, or it would cover it. The shapes themselves are
+  drawn at roughly 70 mm in `presets.js` and scaled by `insertPreset()`; do not re-cut the
+  coordinates to 30 mm, or the fits noted with the heart, the flower and the gingerbread man
+  stop meaning anything.
+- **Upload** (`#svgInput`) takes an SVG *or* an STL and branches on the file name; **Open project**
+  (`#projectInput`) takes a `.cutter` *or* an STL and branches the same way. Both doors are meant:
+  one is "bring a file onto the canvas", the other is "open the cutter I made earlier", and an STL
+  is honestly both. Opening one asks for confirmation when something is drawn, clears undo and
+  replaces the settings, exactly like opening a project.
 - SVG upload opens a size dialog prefilled with the physical size (mm/cm/in units) or 80 mm wide;
   proportion lock; only then is the shape imported. SVG holes become the inner wall; separate
   outside shapes are merged into the outline.
@@ -293,6 +338,13 @@ bars (`bridgeShapes`, Clipper) for the canvas. It is cached per editor version +
 | Each of the three panels can be switched off, but never both views at once | the whole width for the drawing, or for the cutter, is the point; settings only are three panels' worth of numbers with nothing to look at. The last view left is disabled instead of refusing on click, so the reason is there before you press it |
 | The panels are all on at every page load and the state is never saved | like the canvas view, it is how you are sitting at the moment, not what the cutter is; and a project that opened with two panels missing would look broken |
 | Starter shapes are picked from a grid of previews, not a drop-down | a list of names cannot show what you are about to insert, and the shapes are the whole point of the control. The tiles are drawn from the preset data, never from stored pictures |
+| Starter shapes are drawn at ~70 mm and inserted at 30 mm through a size dialog | a cutter for earrings is the common case and 70 mm of circle is nobody's starting point. Asking first costs one keystroke (Enter) and saves a resize every time; the coordinates stay where the fitted outlines were measured |
+| The grid of shapes is two columns on a phone and never more than five | two is what a thumb can hit; past five the tiles are too small to tell a shape from its neighbour, and the grid reads as a list instead of a picture |
+| No starter shape comes to a point sharper than about 50°, the moon's horns excepted | a 33° teardrop tip is a sliver of clay that tears off the cut piece, and no 0.4 mm blade holds it. A moon without horns is not a moon, and at 35° it is no sharper than the gingerbread man's arms, which have always printed |
+| `arcPts()` takes a signed handle length, so an arc can be walked backwards | the moon's bite and the rainbow's inner edge are arcs that curve the other way; with `Math.abs()` their tangents pointed the wrong way and the outline folded over itself |
+| An STL opens as a whole cutter, not just an outline | the numbers are all in the model and measuring them is no harder than measuring the outline; handing back a shape with today's wall settings would quietly change a cutter someone had already printed |
+| An imported STL comes back with Mirror off | both settings make the same solid out of mirrored drawings, so the file cannot say which was used. Off is the one whose top view is the STL you opened, which is what you are looking at |
+| The STL importer measures; it never fits or guesses | a cutter is prisms, so a section is the answer, not an estimate. Anything that reads like a guess (a tolerance, a percentile, a hold-back) is there to keep a boolean or an offset honest, and is named with the reason |
 | Custom tooltips from `title=` instead of native ones | icon-only buttons need an explanation; native titles are slow, unstyled and absent on touch. `app.js` moves every `title=` to `data-tip`, so new markup only needs a `title=`. Phrase it as `Name — what happens`; the part before the em dash is bolded. |
 
 ## 7. Known limitations / backlog
@@ -300,6 +352,8 @@ bars (`bridgeShapes`, Clipper) for the canvas. It is cached per editor version +
 - One residual random stress case (1 in ~1200) produces a single pinched vertex where a very
   narrow bar meets a wobbly outline — not an open edge; slicers accept it.
 - Only one inner wall (largest hole) is supported; more holes are ignored with a toast.
+- The STL importer reads widths and heights to 0.01 mm. Settings typed in tenths come back exactly;
+  a model with real-valued dimensions can rebuild a few tenths of a percent off in volume.
 - No text / imprint stamps, no handle on the cutter, no 3MF export.
 - Regeneration ~150–300 ms; it is debounced (120 ms) and not off-thread. A Web Worker would help on
   slow phones if it ever becomes a complaint.
@@ -310,14 +364,21 @@ bars (`bridgeShapes`, Clipper) for the canvas. It is cached per editor version +
 1. **Mesh integrity** — `node tests/mesh-check.mjs 100`. All fixed cases must PASS with
    0 open / 0 non-manifold edges; random cases should be 0 (a single pinch is tolerable, an
    open edge is not). Add a fixed case whenever you touch `buildCutter`. Every starter shape is
-   a fixed case, so a new or edited preset is checked automatically.
+   a fixed case at both the size it is drawn and the 30 mm it is inserted at (the tighter of the
+   two: the same 3 mm base around a much smaller outline), so a new or edited preset is checked
+   automatically.
 2. **Project round-trip** — `node tests/project-roundtrip.mjs`. All cases must PASS; add one
    whenever you add something to the saved state.
+2b. **STL round-trip** — `node tests/stl-import.mjs 40`. Every fixed case must PASS (same outline
+   point for point, same settings, same solid) and the random cases must come back within 1 % of
+   the volume. Add a case whenever you touch `buildCutter` *or* `stlimport.js` — the importer is
+   the inverse of the builder, so a change to either can only be trusted through both.
 3. **Local run** — `node dev-server.js`, open http://localhost:3002, check the browser console is
    clean, and exercise: draw → 3D appears; Points with a curve; SVG upload of a file with a hole
    (a viewBox-only SVG must trigger the size dialog with 80 mm); symmetry left–right and both;
    grid snap; a guide; Download STL (open it in a slicer if available — no repair warning);
    Save project, reload the page, Open project — the drawing, the settings and the STL must match.
+   Then Upload that same STL: the drawing, every setting and the 3D preview must come back with it.
 4. **Responsive** — check desktop, ~1024 px tablet and ~390 px phone widths (touch: canvas must not
    scroll the page; long-press opens the point menu).
 5. If you have Playwright/Chromium, drive the page headless with

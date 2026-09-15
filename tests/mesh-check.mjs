@@ -43,11 +43,16 @@ const fixed = [
   ['star + small hole', { outer: star, inner: circ(8) }, {}],
   ['mirrored', { outer: star, inner: circ(8) }, { mirror: true }],
 ];
-// The starter shapes, flattened and cleaned exactly the way app.js does before building.
-const { PRESETS } = await import(path.join(root, 'js/presets.js'));
-const { flatten } = await import(path.join(root, 'js/editor.js'));
+// The starter shapes, flattened and cleaned exactly the way app.js does before building —
+// at the size they are inserted at, which is the tight one (a 3 mm base on a 30 mm shape is
+// a different problem from a 3 mm base on a 70 mm one), and at the size they are drawn.
+const { PRESETS, PRESET_SIZE_MM } = await import(path.join(root, 'js/presets.js'));
+const { flatten, mapPts } = await import(path.join(root, 'js/editor.js'));
 for (const [key, p] of Object.entries(PRESETS)) {
-  fixed.push([`starter shape: ${key}`, G.cleanPolygon(flatten(p.make()), 0.002), {}]);
+  const pts = p.make(), b = G.bounds(flatten(pts)), s = PRESET_SIZE_MM / Math.max(b.width, b.height);
+  const at = (k) => G.cleanPolygon(flatten(mapPts(pts, q => ({ x: q.x * k, y: q.y * k }))), 0.002);
+  fixed.push([`starter shape: ${key} at ${PRESET_SIZE_MM} mm`, at(s), {}]);
+  fixed.push([`starter shape: ${key} as drawn`, at(1), {}]);
 }
 
 let failed = 0;
