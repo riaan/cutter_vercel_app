@@ -8,6 +8,10 @@
 //   widths    the distance from the cut line out to that tier's outer edge, less FAT
 //   bars      what is left of the base section inside the channel between the two walls
 //
+// A file may hold several cutters side by side. They never touch, so the triangles fall into
+// separate connected lumps; each lump is read on its own and becomes one shape, with its own
+// wall settings, in the place the file puts it.
+//
 // What cannot come back: Bézier handles and symmetry (the STL only ever held the flattened
 // outline) and the Mirror setting (both settings make the same solid from mirrored drawings,
 // so the shape is read back with Mirror off, which reproduces this very STL).
@@ -45,6 +49,82 @@ export function parseSTL(buffer) {
   while ((m = re.exec(text))) out.push(+m[1], +m[2], +m[3]);
   if (out.length < 9 || out.length % 9) throw new Error('This STL is damaged — its triangles are incomplete.');
   return new Float32Array(out);
+}
+
+// The footprint of a lump of triangles, and whether one sits inside another. Two cutters on a
+// plate never overlap in plan, so nesting can only mean the two lumps are one cutter.
+function xyBox(pos) {
+  const b = box3(pos);
+  return { minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY, area: b.width * b.height };
+}
+const boxInside = (a, b) => a.minX >= b.minX - 1e-4 && a.maxX <= b.maxX + 1e-4
+  && a.minY >= b.minY - 1e-4 && a.maxY <= b.maxY + 1e-4 && a.area < b.area * 0.999;
+
+// Triangles that share a corner belong to the same solid. Cutters on one plate are kept a
+// nozzle width apart, so the lumps this finds are the shapes — biggest first. The one exception
+// is a cutter whose inner wall has no connection bars: that wall is a lump of its own, standing
+// inside the outer wall's footprint, and it is folded back into the cutter it belongs to.
+export function splitSolids(pos) {
+  const n = pos.length / 9;
+  if (n < 2) return [pos];
+  const key = (i) => `${Math.round(pos[i] * 1e4)},${Math.round(pos[i + 1] * 1e4)},${Math.round(pos[i + 2] * 1e4)}`;
+  const parent = new Int32Array(n);
+  for (let i = 0; i < n; i++) parent[i] = i;
+  const find = (a) => { while (parent[a] !== a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; };
+  const seen = new Map();
+  for (let t = 0; t < n; t++) {
+    for (let c = 0; c < 3; c++) {
+      const k = key(t * 9 + c * 3);
+      const other = seen.get(k);
+      if (other === undefined) seen.set(k, t);
+      else { const a = find(other), b = find(t); if (a !== b) parent[b] = a; }
+    }
+  }
+  const groups = new Map();
+  for (let t = 0; t < n; t++) {
+    const r = find(t);
+    let g = groups.get(r);
+    if (!g) { g = []; groups.set(r, g); }
+    g.push(t);
+  }
+  if (groups.size < 2) return [pos];
+  const lumps = [];
+  for (const g of groups.values()) {
+    const a = new Float32Array(g.length * 9);
+    for (let i = 0; i < g.length; i++) a.set(pos.subarray(g[i] * 9, g[i] * 9 + 9), i * 9);
+    lumps.push(a);
+  }
+
+  // Fold every lump into the smallest lump whose footprint contains it — an inner wall with no
+  // bars into its cutter — following the chain up to the one that is inside nothing.
+  const boxes = lumps.map(xyBox);
+  const host = boxes.map((b, i) => {
+    let best = -1;
+    for (let j = 0; j < boxes.length; j++) {
+      if (j !== i && boxInside(b, boxes[j]) && (best < 0 || boxes[j].area < boxes[best].area)) best = j;
+    }
+    return best;
+  });
+  const rootOf = (i) => { for (let g = 0; g < boxes.length && host[i] >= 0; g++) i = host[i]; return i; };
+  const merged = new Map();
+  for (let i = 0; i < lumps.length; i++) {
+    const r = rootOf(i);
+    let list = merged.get(r);
+    if (!list) { list = []; merged.set(r, list); }
+    list.push(lumps[i]);
+  }
+  const out = [];
+  for (const list of merged.values()) {
+    if (list.length === 1) { out.push(list[0]); continue; }
+    const n = list.reduce((t, a) => t + a.length, 0);
+    const joined = new Float32Array(n);
+    let at = 0;
+    for (const a of list) { joined.set(a, at); at += a.length; }
+    out.push(joined);
+  }
+  if (out.length < 2) return [pos];
+  out.sort((a, b) => b.length - a.length);
+  return out;
 }
 
 function box3(pos) {
@@ -314,16 +394,15 @@ const orient = (pts, ccw) => (signedArea(pts) > 0) === ccw ? pts : pts.slice().r
 
 // ---------- the whole job ----------
 
-// buffer (an .stl file) -> the drawing and the settings that build it again.
+// One solid -> the drawing and the settings that build it again.
 // Returns { shape, params, size, footprint, tiers, notes, outlineOnly }, in screen space (y down).
-export function importSTL(buffer) {
-  const pos = parseSTL(buffer);
-  if (pos.length < 4 * 9) throw new Error('This STL has no solid in it.');
+export function readCutter(pos) {
   const bb = box3(pos);
   if (bb.depth < 1) throw new Error('This model is flat — a cutter has to stand up.');
   if (bb.width < 2 || bb.height < 2) throw new Error('This model is too small to be a cutter.');
 
   const notes = [];
+
   const levels = tierLevels(pos, bb);
   const tiers = [];
   for (let i = 0; i < levels.length - 1; i++) {
@@ -400,5 +479,38 @@ export function importSTL(buffer) {
     points: shape.outer.length + shape.inner.length,
     outlineOnly,
     notes,
+  };
+}
+
+// buffer (an .stl file) -> one entry per cutter in it, and the size of the whole plate.
+export function importSTL(buffer) {
+  const pos = parseSTL(buffer);
+  if (pos.length < 4 * 9) throw new Error('This STL has no solid in it.');
+  const solids = splitSolids(pos);
+  const parts = [];
+  const notes = [];
+  if (solids.length === 1) {
+    parts.push(readCutter(solids[0]));
+  } else {
+    let skipped = 0;
+    for (const sp of solids) {
+      try { parts.push(readCutter(sp)); } catch { skipped++; }
+    }
+    // Nothing usable: let the biggest lump say why, in its own words.
+    if (!parts.length) readCutter(solids[0]);
+    notes.push(`${parts.length} shapes were found in this file; each came back with its own settings.`);
+    if (skipped) notes.push(`${skipped} piece${skipped === 1 ? '' : 's'} too small to be a cutter ${skipped === 1 ? 'was' : 'were'} left out.`);
+  }
+  for (const part of parts) for (const n of part.notes) if (!notes.includes(n)) notes.push(n);
+
+  const bb = box3(pos);
+  const all = parts.map(p => p.shape.outer).flat();
+  const size = bounds(all);
+  return {
+    parts,
+    notes,
+    size: { width: size.width, height: size.height },
+    footprint: { width: bb.width, height: bb.height, height3d: bb.depth },
+    points: parts.reduce((t, p) => t + p.points, 0),
   };
 }

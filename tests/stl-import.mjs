@@ -51,9 +51,11 @@ for (const [label, shape, params] of cases) {
   const built = G.buildCutter(shape, want);
   const stl = G.toBinarySTL(built.positions, 'case');
 
-  let read, rebuilt, problems = [];
+  let all, read, rebuilt, problems = [];
   try {
-    read = S.importSTL(stl);
+    all = S.importSTL(stl);
+    if (all.parts.length !== 1) throw new Error(`${all.parts.length} solids found in a one-cutter file`);
+    read = all.parts[0];
     rebuilt = G.buildCutter(read.shape, read.params);
   } catch (e) {
     console.log(`FAIL  ${label}: ${e.message}`);
@@ -122,7 +124,7 @@ for (const [label, shape, params] of cases) {
   const bytes = new TextEncoder().encode(txt);
   let ok = false, why = '';
   try {
-    const read = S.importSTL(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    const read = S.importSTL(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)).parts[0];
     ok = read.params.bridgeCount === 4 && Math.abs(read.size.width - 60) < 0.05 && Math.abs(read.params.height - 15) < 0.02;
     why = `${read.size.width.toFixed(2)} mm wide, ${read.params.height} mm tall, ${read.params.bridgeCount} bars`;
   } catch (e) { why = e.message; }
@@ -155,13 +157,56 @@ for (const [label, shape, params] of cases) {
   const stl = G.toBinarySTL(new Float32Array(box), 'box');
   let ok = false, why = '';
   try {
-    const read = S.importSTL(stl);
-    ok = read.outlineOnly && read.notes.length > 0 && Math.abs(read.size.width - 40) < 0.01
+    const whole = S.importSTL(stl), read = whole.parts[0];
+    ok = read.outlineOnly && whole.notes.length > 0 && Math.abs(read.size.width - 40) < 0.01
       && Math.abs(read.size.height - 30) < 0.01 && read.params.bladeWidth === G.DEFAULT_PARAMS.bladeWidth;
-    why = `${read.size.width.toFixed(1)} × ${read.size.height.toFixed(1)} mm outline, ${read.notes.length} note(s)`;
+    why = `${read.size.width.toFixed(1)} × ${read.size.height.toFixed(1)} mm outline, ${whole.notes.length} note(s)`;
   } catch (e) { why = e.message; }
   if (!ok) failed++;
   console.log(`${ok ? 'PASS' : 'FAIL'}  a plain solid falls back to its outline (${why})`);
+}
+
+// A plate of several cutters: every one of them comes back, in its place, with the settings it
+// was built from. This is what makes an STL of a whole plate as good as a project file.
+{
+  const at = (pts, dx, dy) => pts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+  const plate = [
+    { shape: { outer: clean(at(circ(20), -45, 0)), inner: clean(at(circ(10), -45, 0)) }, params: P({ height: 12, bridgeCount: 3, bridgeWidth: 2.5 }) },
+    { shape: { outer: clean(at(star, 45, 0)), inner: null }, params: P({ height: 22, bladeWidth: 0.7, ridge: false, baseWidth: 4 }) },
+  ];
+  const built = G.buildAll(plate);
+  const problems = [];
+  let read;
+  try {
+    read = S.importSTL(G.toBinarySTL(built.positions, 'plate'));
+  } catch (e) { problems.push(e.message); }
+  if (read) {
+    if (read.parts.length !== 2) problems.push(`${read.parts.length} shapes instead of 2`);
+    else {
+      // The importer hands them back biggest first; match each one to the source by its width.
+      const byWidth = [...read.parts].sort((a, b) => a.size.width - b.size.width);
+      const want = [...plate].sort((a, b) => G.bounds(a.shape.outer).width - G.bounds(b.shape.outer).width);
+      for (let i = 0; i < 2; i++) {
+        for (const k of ['height', 'bladeWidth', 'baseWidth', 'baseHeight']) {
+          if (Math.abs(byWidth[i].params[k] - want[i].params[k]) > 0.011) {
+            problems.push(`shape ${i + 1}: ${k} ${byWidth[i].params[k]} vs ${want[i].params[k]}`);
+          }
+        }
+        if (byWidth[i].params.ridge !== want[i].params.ridge) problems.push(`shape ${i + 1}: ridge`);
+      }
+      // and the whole plate rebuilds to the same solid, shapes in the same places
+      const again = G.buildAll(read.parts.map(p => ({ shape: p.shape, params: p.params })));
+      const off = Math.abs(again.volumeMm3 - built.volumeMm3) / built.volumeMm3;
+      if (off > 0.004) problems.push(`volume off by ${(off * 100).toFixed(2)}%`);
+      for (const k of ['width', 'height']) {
+        if (Math.abs(again.footprint[k] - built.footprint[k]) > 0.05) {
+          problems.push(`plate ${k} ${again.footprint[k].toFixed(2)} vs ${built.footprint[k].toFixed(2)}`);
+        }
+      }
+    }
+  }
+  if (problems.length) { failed++; console.log(`FAIL  a plate of two cutters\n      ${problems.join('\n      ')}`); }
+  else console.log(`PASS  a plate of two cutters (${read.parts.length} shapes, ${read.size.width.toFixed(1)} × ${read.size.height.toFixed(1)} mm)`);
 }
 
 // optional random stress: node tests/stl-import.mjs 40
@@ -180,7 +225,7 @@ if (N > 0) {
     let a, b;
     try { a = G.buildCutter({ outer, inner }, params); } catch { skipped++; continue; }
     try {
-      const read = S.importSTL(G.toBinarySTL(a.positions, 'r'));
+      const read = S.importSTL(G.toBinarySTL(a.positions, 'r')).parts[0];
       b = G.buildCutter(read.shape, read.params);
     } catch (e) { bad++; console.log(`  random ${k}: ${e.message}`); continue; }
     // Measured widths and heights are reported to 0.01 mm, which is what the settings panel can

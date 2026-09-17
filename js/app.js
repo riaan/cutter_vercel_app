@@ -4,7 +4,7 @@ import { importSVG } from './svgimport.js';
 import { importSTL } from './stlimport.js';
 import { PRESETS, PRESET_SIZE_MM } from './presets.js';
 import { packProject, unpackProject, PROJECT_EXT } from './project.js';
-import { buildCutter, toBinarySTL, offsetPolygon, cleanPolygon, bounds, bridgeShapes, signedArea,
+import { buildAll, toBinarySTL, offsetPolygon, cleanPolygon, bounds, bridgeShapes, signedArea, simplify,
          unionPolygons, loadManifold, manifoldReady, DEFAULT_PARAMS } from './geometry.js';
 
 const $ = (id) => document.getElementById(id);
@@ -14,73 +14,104 @@ const $ = (id) => document.getElementById(id);
 let tipTarget = null, tipTimer = 0;
 
 // ---------- state ----------
-const params = { ...DEFAULT_PARAMS };
-let result = null;          // last successful buildCutter() result
-let rings = null;           // 2D preview rings for the editor
-let ringsKey = '';
+// The drawing is a plate of shapes; the editor owns them. `params` is always the wall settings
+// of the shape being edited — it is re-pointed whenever you switch shapes, so every control
+// below keeps reading and writing the one object the active shape is built from.
+let params = { ...DEFAULT_PARAMS };
+let result = null;          // last successful build of the whole plate
 let regenTimer = null;
 
 // ---------- editor & viewer ----------
 const editor = new ShapeEditor($('drawCanvas'), {
   onChange: onShapeChange,
-  rings: (shape) => ringsFor(shape),
+  rings: ringsFor,
   onSelect: updatePointBar,
   onMenu: openPointMenu,
   onView: syncZoomUI,
+  onBlock: (msg) => toast(msg),
 });
 const viewer = new CutterViewer($('viewer'));
+params = editor.params;
 
-function onShapeChange(shape) {
+// Which shape the settings panel was last showing. Switching shapes — from the list, from undo,
+// or from opening a file — has to bring its own settings along with it.
+let shownLayer = null;
+
+function onShapeChange(shape, { selectionOnly = false } = {}) {
+  params = editor.params;
+  if (editor.layer.id !== shownLayer) { shownLayer = editor.layer.id; syncShapeContext(); }
   syncSizeInputs(shape.outer);
   const hasOuter = shape.outer.length >= 3;
   const innerBtn = document.querySelector('.seg[data-active=inner]');
   innerBtn.disabled = !hasOuter;
   if (!hasOuter && editor.active === 'inner') setActive('outer');
   updateHint(shape);
+  updateShapeBar();
   $('undoBtn').disabled = !editor.canUndo;
   $('redoBtn').disabled = !editor.canRedo;
   $('secInnerWrap').hidden = shape.inner.length < 3;
   syncWallActions();
   autoBridgeWidth(shape);
-  setSaveEnabled(hasOuter);
-  $('resultBtn').disabled = !hasOuter;
-  scheduleRegen();
+  renderShapeList();
+  const any = editor.hasAnyShape;
+  setSaveEnabled(any);
+  $('resultBtn').disabled = !any;
+  if (!selectionOnly) scheduleRegen();   // stepping to another shape does not change any solid
+}
+
+// Everything that belongs to the shape you are on rather than to the plate: its wall settings,
+// its mirror switches and the label that says whose settings the panel is showing.
+function syncShapeContext() {
+  params = editor.params;
+  syncParamInputs();
+  syncSymButtons();
+  drawProfile();
+  refreshSummaries();
+}
+
+function syncSymButtons() {
+  $('symXBtn').setAttribute('aria-pressed', String(editor.sym.x));
+  $('symYBtn').setAttribute('aria-pressed', String(editor.sym.y));
 }
 
 // Connection thickness defaults to 10% of the shape's width, rounded to 0.5 mm.
-let bridgeAuto = true;
 function autoBridgeWidth(shape) {
-  if (!bridgeAuto || shape.outer.length < 3) return;
+  if (!editor.layer.bridgeAuto || shape.outer.length < 3) return;
   const w = bounds(shape.outer).width;
   const v = Math.max(0.5, Math.round(w * 0.1 * 2) / 2);
   if (v !== params.bridgeWidth) {
     params.bridgeWidth = v;
     $('pBridgeWidth').value = v;
-    ringsKey = ''; editor.requestRender();
+    editor.requestRender();
   }
 }
 $('bridgeAutoBtn').addEventListener('click', () => {
-  bridgeAuto = !bridgeAuto;
-  $('bridgeAutoBtn').setAttribute('aria-pressed', String(bridgeAuto));
-  if (bridgeAuto) { autoBridgeWidth(editor.getShape()); scheduleRegen(); }
+  const on = !editor.layer.bridgeAuto;
+  editor.layer.bridgeAuto = on;
+  $('bridgeAutoBtn').setAttribute('aria-pressed', String(on));
+  if (on) { autoBridgeWidth(editor.getShape()); scheduleRegen(); }
 });
 
-// Offsets for the 2D preview (walls + connections), cached per shape version.
-function ringsFor(shape) {
-  const key = `${editor.version}|${shape === editor.shape ? 'r' : 's'}|${JSON.stringify(params)}`;
-  if (key === ringsKey) return rings;
-  ringsKey = key;
+// Offsets for the 2D preview (walls + connections). Every shape has its own walls, so there is
+// one entry per shape, kept until that shape or its settings change.
+const ringsCache = new Map();
+function ringsFor(shape, p, id, rev) {
+  const sig = `${rev}|${JSON.stringify(p)}`;
+  const hit = ringsCache.get(id);
+  if (hit && hit.sig === sig) return hit.rings;
+  let rings = null;
   try {
-    const bw = params.bladeWidth, baseW = Math.max(bw, params.baseWidth);
-    const rw = params.ridge ? Math.min(baseW, Math.max(bw, params.ridgeWidth)) : null;
+    const bw = p.bladeWidth, baseW = Math.max(bw, p.baseWidth);
+    const rw = p.ridge ? Math.min(baseW, Math.max(bw, p.ridgeWidth)) : null;
     const o = shape.outer, i = shape.inner.length >= 3 ? shape.inner : null;
     rings = {
       base: offsetPolygon(o, baseW), ridge: rw ? offsetPolygon(o, rw) : null, blade: offsetPolygon(o, bw),
       innerBase: i ? offsetPolygon(i, -baseW) : null, innerRidge: i && rw ? offsetPolygon(i, -rw) : null,
       innerBlade: i ? offsetPolygon(i, -bw) : null,
-      bridges: i ? bridgeShapes(o, i, params) : null,
+      bridges: i ? bridgeShapes(o, i, p) : null,
     };
   } catch { rings = null; }
+  ringsCache.set(id, { sig, rings });
   return rings;
 }
 
@@ -95,12 +126,26 @@ function syncSizeInputs(points) {
 
 function updateHint(shape) {
   const hint = $('drawHint'), text = $('drawHintText');
-  if (editor.active === 'inner' && shape.inner.length < 3 && shape.outer.length >= 3) {
-    text.innerHTML = '<strong>Draw the inner wall</strong> inside the shape — the area between the two walls is what gets cut out. Sketch it, place corners, or upload an SVG that already has a hole.';
+  // An outline still being placed comes first: nothing else the hint could say matters while
+  // the one thing to do is finish it.
+  const draft = editor.tool === 'points' ? editor.draft : null;
+  if (draft && draft.count >= 1) {
+    hint.classList.add('corner');
+    text.innerHTML = draft.closable
+      ? '<strong>Click the first point to close the shape.</strong> Until then these corners are only a line — there is nothing to cut yet.'
+      : '<strong>Keep placing corners.</strong> Three of them make a shape; click the first point again to close it.';
+    hint.hidden = false;
+  } else if (editor.active === 'inner' && shape.inner.length < 3 && shape.outer.length >= 3) {
+    text.innerHTML = '<strong>Draw the inner wall</strong> inside the shape — the area between the two walls is what gets cut out. Sketch it, place corners, or import an SVG that already has a hole.';
     hint.classList.add('corner'); hint.hidden = false;
+  } else if (shape.outer.length < 1 && editor.hasAnyShape) {
+    // An empty shape next to shapes that are already drawn: say where it may go.
+    hint.classList.add('corner');
+    text.innerHTML = `<strong>Draw shape ${editor.index + 1}.</strong> Keep it clear of the shapes already on the plate — two cutters that touch come off the printer as one.`;
+    hint.hidden = false;
   } else if (shape.outer.length < 1) {
     hint.classList.remove('corner');
-    text.innerHTML = '<strong>Draw the shape to cut.</strong> Drag to sketch — the outline closes and smooths itself. Or place corners one by one with <em>Points</em>, pick a starter shape, or upload an SVG — or an STL of a cutter you made before.';
+    text.innerHTML = '<strong>Draw the shape to cut.</strong> Drag to sketch — the outline closes and smooths itself. Or place corners one by one with <em>Points</em>, pick a starter shape, or import an SVG — or an STL of a cutter you made before.';
     hint.hidden = false;
   } else hint.hidden = true;
 }
@@ -111,11 +156,14 @@ function scheduleRegen() {
   regenTimer = setTimeout(regenerate, 120);
 }
 
+// The 3D preview and the STL are always the whole plate: every shape, each with its own
+// settings, in the place it sits on the canvas. Nothing is greyed out or left out here — this
+// is what comes off the printer.
 function regenerate() {
-  const shape = editor.getShape();
   const err = $('errorBox');
   if (!manifoldReady()) return; // the engine calls regenerate() again once loaded
-  if (shape.outer.length < 3) {
+  const parts = editor.buildParts();
+  if (!parts.length) {
     result = null; viewer.clearMesh(); err.hidden = true;
     $('viewerHint').hidden = false; setDownloadEnabled(false);
     $('statFootprint').textContent = '—'; $('statHeight').textContent = '—'; $('statTris').textContent = '—';
@@ -123,10 +171,13 @@ function regenerate() {
     return;
   }
   try {
-    const outer = cleanPolygon(shape.outer, 0.002);
-    if (!outer) throw new Error('The outline crosses itself too much to make a cutter. Try Undo or Clear.');
-    const inner = shape.inner.length >= 3 ? cleanPolygon(shape.inner, 0.002) : null;
-    result = buildCutter({ outer, inner }, params);
+    const built = parts.map(part => {
+      const outer = cleanPolygon(part.shape.outer, 0.002);
+      if (!outer) throw new Error(`${part.label}: the outline crosses itself too much to make a cutter. Try Undo or Clear.`);
+      const inner = part.shape.inner.length >= 3 ? cleanPolygon(part.shape.inner, 0.002) : null;
+      return { label: part.label, shape: { outer, inner }, params: part.params };
+    });
+    result = buildAll(built);
     viewer.setMesh(result.positions, result.bounds);
     err.hidden = true; $('viewerHint').hidden = true;
     setDownloadEnabled(true);
@@ -134,8 +185,9 @@ function regenerate() {
     $('statFootprint').textContent = `${f.width.toFixed(1)} × ${f.height.toFixed(1)} mm`;
     $('statHeight').textContent = `${f.height3d.toFixed(1)} mm`;
     $('statTris').textContent = `${(cm3 * 1.24).toFixed(1)} g`;
-    $('stats').title = `${cm3.toFixed(1)} cm³ · ${result.triangles.toLocaleString()} triangles`;
-    setReady('Watertight · ready');
+    $('stats').title = `${cm3.toFixed(1)} cm³ · ${result.triangles.toLocaleString()} triangles`
+      + (built.length > 1 ? ` · ${built.length} shapes` : '');
+    setReady(built.length > 1 ? `${built.length} shapes · ready` : 'Watertight · ready');
     checkAgainstSaved();
   } catch (e) {
     result = null; viewer.clearMesh(); setDownloadEnabled(false);
@@ -157,7 +209,8 @@ function download() {
   const a = document.createElement('a');
   a.href = url; a.download = `${name}.stl`; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
-  toast(`Saved ${name}.stl — print it base down, no supports.`);
+  const n = result.parts ? result.parts.length : 1;
+  toast(`Saved ${name}.stl — ${n > 1 ? `${n} shapes, ` : ''}print it base down, no supports.`);
 }
 $('downloadBtn').addEventListener('click', download);
 $('downloadBtnMobile').addEventListener('click', download);
@@ -173,9 +226,7 @@ function fileBaseName() { return ($('fileName').value || 'cutter').trim().replac
 
 function currentState() {
   return {
-    ...editor.getState(),
-    params: { ...params },
-    bridgeAuto,
+    ...editor.getState(),   // every shape, with its own contours, mirror and wall settings
     name: fileBaseName(),
     stats: result ? { width: result.footprint.width, height: result.footprint.height, height3d: result.footprint.height3d } : null,
   };
@@ -220,38 +271,34 @@ async function openProject(file) {
     toast(e.message || 'Could not open that project file.');
     return;
   }
-  if (editor.hasOuter) {
+  if (editor.hasAnyShape) {
     const ok = await confirmAction('Open this project?',
-      'What is on the canvas now is replaced by the saved drawing and its settings. This cannot be undone.', 'Open');
+      'Every shape on the canvas now is replaced by the saved drawing and its settings. This cannot be undone.', 'Open');
     if (!ok) return;
   }
   applyState(state);
-  toast(`Opened ${file.name} — shape and settings restored.`);
+  const n = state.layers.length;
+  toast(`Opened ${file.name} — ${n > 1 ? `${n} shapes` : 'shape'} and settings restored.`);
+  setTimeout(warnIfClashing, 1200);
 }
 
-// Order matters: symmetry and the seeds go in together, then the settings the 3D build reads.
+// The shapes go in first, settings and all; everything after that only follows them.
 function applyState(state) {
+  shownLayer = null;         // force the settings panel to pick up the shape it lands on
+  ringsCache.clear();
   editor.setState(state);
-
-  Object.assign(params, state.params);
-  bridgeAuto = state.bridgeAuto;
-  $('bridgeAutoBtn').setAttribute('aria-pressed', String(bridgeAuto));
-  syncParamInputs();
+  syncShapeContext();
 
   $('fileName').value = state.name || 'cutter';
-  $('symXBtn').setAttribute('aria-pressed', String(state.sym.x));
-  $('symYBtn').setAttribute('aria-pressed', String(state.sym.y));
-  $('gridSize').value = String(state.grid.size);
-  $('snapBtn').setAttribute('aria-pressed', String(state.grid.snap));
-  $('smoothing').value = String(state.smoothing);
-  $('smoothingVal').textContent = state.smoothing.toFixed(2);
+  $('gridSize').value = String(editor.grid.size);
+  $('snapBtn').setAttribute('aria-pressed', String(editor.grid.snap));
+  setSmoothing(editor.smoothing);
   $('lockBtn').setAttribute('aria-pressed', String(editor.lockAspect));
 
   setTool(editor.tool);
   setActive(editor.active);
-  ringsKey = '';
   onParamsChanged();
-  refreshSummaries();
+  renderShapeList();
   editor.requestRender();
 
   // A saved size that no longer builds the same would mean the geometry changed under the
@@ -282,34 +329,42 @@ async function openSTL(file) {
     toast(e.message || 'Could not read that STL.');
     return;
   }
-  if (editor.hasOuter) {
+  if (editor.hasAnyShape) {
     const ok = await confirmAction('Open this STL?',
-      'What is on the canvas now is replaced by the shape and the settings read out of the model. This cannot be undone.', 'Open');
+      'Every shape on the canvas now is replaced by the shapes and the settings read out of the model. This cannot be undone.', 'Open');
     if (!ok) return;
   }
   applyState({
     ...editor.getState(), // the grid, the smoothing and the aspect lock are yours, not the file's
-    shape: res.shape,
-    sym: { x: false, y: false }, // an STL holds the whole outline, never a half to mirror
+    // One cutter in the file, one shape on the canvas — each with the settings measured off it.
+    layers: res.parts.map(part => ({
+      shape: part.shape,
+      sym: { x: false, y: false },   // an STL holds whole outlines, never a half to mirror
+      symOrigin: { x: 0, y: 0 },
+      params: part.params,
+      bridgeAuto: false,
+    })),
+    index: 0,
     active: 'outer',
     tool: 'move',
-    params: res.params,
-    bridgeAuto: false,
     name: file.name.replace(/\.stl$/i, '').replace(/[^\w\-]+/g, '-') || 'cutter',
     // the same check a project gets: rebuild it and say so if the result is not that model
     stats: { ...res.footprint, warning: 'Opened, but the cutter this builds comes out slightly different from the STL. Check the wall settings.' },
   });
   toast(describeSTL(file.name, res));
+  setTimeout(warnIfClashing, 1200);
 }
 
 function describeSTL(name, res) {
-  const p = res.params;
-  const bits = [`${res.size.width.toFixed(1)} × ${res.size.height.toFixed(1)} mm`, `${p.height} mm tall`];
-  if (!res.outlineOnly) {
+  const first = res.parts[0], p = first.params;
+  const bits = [`${res.size.width.toFixed(1)} × ${res.size.height.toFixed(1)} mm`];
+  if (res.parts.length > 1) bits.unshift(`${res.parts.length} shapes`);
+  bits.push(`${p.height} mm tall`);
+  if (!first.outlineOnly) {
     bits.push(`${p.bladeWidth} mm blade`);
     if (p.baseHeight > 0) bits.push(`${p.baseWidth} mm base`);
     if (p.ridge) bits.push('support step');
-    if (res.shape.inner.length >= 3) bits.push(`${p.bridgeCount} connection${p.bridgeCount === 1 ? '' : 's'}`);
+    if (first.shape.inner.length >= 3) bits.push(`${p.bridgeCount} connection${p.bridgeCount === 1 ? '' : 's'}`);
   }
   return `Rebuilt from ${name} — ${bits.join(', ')}.` + (res.notes.length ? ' ' + res.notes.join(' ') : '');
 }
@@ -328,22 +383,46 @@ setSaveEnabled(false);
 // ---------- tools ----------
 const TOOL_TIPS = {
   draw: 'Drag to sketch the outline in one go.',
-  points: 'Tap to add corners, tap a line to insert one. Select a corner to delete it or give it a curve; right-click (or hold) for the menu.',
-  move: 'Drag the shape to move it. Use the handles to resize and the top knob to rotate. Two fingers pinch and twist.',
+  points: 'Tap to place corners one after the other, then click the first one again to close the shape. Hold and pull as you place one and it comes out curved. After that, tap a line to insert a corner. Select one to delete it or give it a curve; right-click (or hold) for the menu.',
+  move: 'Drag the shape to move it — hold Shift to keep it on one line. Use the handles to resize, with Alt to resize around the middle, and the top knob to rotate. Arrow keys nudge it by 1 mm. Two fingers pinch and twist.',
 };
-// The tool explanation reads itself out for a few seconds, then tucks away behind its (i).
-const TOOL_TIP_HOLD = 5000;
+// The tool explanation stays behind its (i), which sits in the toolbar beside the three tools:
+// it is there to be asked for, never to announce itself, so picking a tool only loads the text
+// and it is hover (or, on touch, a tap) that brings it out. The text itself floats under the
+// icon: placed here rather than in CSS, so opening it never pushes the toolbar about and it
+// stays inside the window however narrow it gets.
+const TOOL_TIP_HOLD = 5000;   // a tap has no pointerleave to close it, so it times out
 let toolTipTimer = 0;
+function placeToolTip() {
+  const icon = $('toolTipIcon'), text = $('toolTipText');
+  const r = icon.getBoundingClientRect(), gap = 6;
+  const w = text.offsetWidth, h = text.offsetHeight;   // ignores the slide transform
+  const left = Math.min(Math.max(8, r.left), window.innerWidth - w - 8);
+  const below = r.bottom + gap;
+  const top = below + h > window.innerHeight - 8 ? Math.max(8, r.top - gap - h) : below;
+  text.style.left = `${Math.round(left)}px`;
+  text.style.top = `${Math.round(top)}px`;
+}
 function setToolTipOpen(open) {
+  if (open) placeToolTip();
   $('toolTip').classList.toggle('collapsed', !open);
   $('toolTipIcon').setAttribute('aria-expanded', String(open));
 }
-function showToolTip(text) {
+// Switching tools only loads the sentence; whether it is on screen is the pointer's business.
+function setToolTipText(text) {
   $('toolTipText').textContent = text;
+  if (!$('toolTip').classList.contains('collapsed')) placeToolTip();   // hovering: it just changed width
+}
+function showToolTip(text) {
+  setToolTipText(text);
   setToolTipOpen(true);
   clearTimeout(toolTipTimer);
   toolTipTimer = setTimeout(() => setToolTipOpen(false), TOOL_TIP_HOLD);
 }
+// It is fixed to the window, so anything that moves the icon has to move the text after it.
+const followToolTip = () => { if (!$('toolTip').classList.contains('collapsed')) placeToolTip(); };
+window.addEventListener('resize', followToolTip);
+window.addEventListener('scroll', followToolTip, true);
 $('toolTipIcon').addEventListener('pointerenter', (e) => {
   if (e.pointerType === 'touch') return;          // touch toggles on tap instead
   clearTimeout(toolTipTimer); setToolTipOpen(true);
@@ -364,8 +443,9 @@ function setTool(tool) {
   document.querySelectorAll('.seg[data-tool]').forEach(b => {
     const on = b.dataset.tool === tool; b.classList.toggle('active', on); b.setAttribute('aria-selected', on);
   });
-  showToolTip(TOOL_TIPS[tool] + (editor.symOn ? ' Only the bright side is editable — the mirror side follows.' : ''));
-  updatePointBar(null); closeMenu();
+  setToolTipText(TOOL_TIPS[tool] + (editor.symOn ? ' Only the bright side is editable — the mirror side follows.' : ''));
+  updatePointBar(null); updateShapeBar(); updateHint(editor.getShape());
+  syncRoundBar(); syncSmoothSection(); closeMenu();
 }
 setTool('draw');
 
@@ -377,7 +457,9 @@ function setActive(which) {
     const on = b.dataset.active === which; b.classList.toggle('active', on); b.setAttribute('aria-selected', on);
   });
   syncWallActions();
+  updateShapeBar();
   updateHint(editor.getShape());
+  syncRoundBar();
 }
 
 // Centre, align, flip and clear all act on the wall you are editing, so the controls change with
@@ -386,10 +468,16 @@ function syncWallActions() {
   const inner = editor.active === 'inner';
   const shape = editor.getShape();
   const hasWall = (inner ? shape.inner : shape.outer).length >= 3;
-  for (const id of ['centerBtn', 'flipXBtn', 'flipYBtn', 'clearBtn', 'shapeActionsDivider']) $(id).hidden = !hasWall;
-  $('roundBtn').disabled = !hasWall;
+  // An unfinished outline is not a wall, but it is something: Clear has to be able to get rid
+  // of it, and Flip works on the line as it stands.
+  const something = hasWall || !!editor.draft;
+  for (const id of ['centerBtn', 'flipXBtn', 'flipYBtn', 'clearBtn', 'shapeActionsDivider']) $(id).hidden = !something;
+  // While the tool is open the canvas is showing a preview, so nothing else may change the shape.
+  const rounding = !!editor.rounding;
+  for (const id of ['centerBtn', 'flipXBtn', 'flipYBtn', 'clearBtn', 'alignBtn']) $(id).disabled = rounding;
+  $('centerBtn').disabled = inner || rounding;
+  syncRoundBar();
   // Centring moves the whole drawing; on its own the inner wall has Align instead.
-  $('centerBtn').disabled = inner;
   $('alignWrap').hidden = !inner || !hasWall;
   if ($('alignWrap').hidden) setAlignMenu(false);
   $('alignBtn').disabled = !(shape.outer.length >= 3 && shape.inner.length >= 3);
@@ -399,18 +487,90 @@ function syncWallActions() {
   setTip($('flipYBtn'), inner
     ? 'Flip top–bottom — mirror the inner wall vertically inside the shape. The outer wall is not touched.'
     : 'Flip top–bottom — mirror the whole shape vertically, inner wall and all. The size stays the same.');
+  const many = editor.layerCount > 1;
   setTip($('clearBtn'), inner
     ? 'Clear — remove the inner wall only. The outer wall stays. You can undo this.'
-    : 'Clear — remove the whole drawing, inner wall included, and start over. You can undo this.');
+    : many
+      ? `Clear — empty shape ${editor.index + 1}, inner wall included. The other shapes stay. You can undo this.`
+      : 'Clear — remove the whole drawing, inner wall included, and start over. You can undo this.');
+  setTip($('centerBtn'), many
+    ? 'Center — move the whole drawing to the middle of the canvas. Every shape moves together, so they keep their places relative to each other.'
+    : 'Center — move the whole shape to the middle of the canvas. The shape and its size stay the same.');
 }
 setActive('outer');
 
-$('smoothing').addEventListener('input', (e) => { editor.smoothing = parseFloat(e.target.value); });
+// Sketch smoothing lives in the Canvas flyout and belongs to the pen: it is what a freehand
+// stroke is cleaned up by when you lift it. Rounding a shape that is already drawn is the
+// rounding tool below, which has a dial of its own.
+function setSmoothing(v) {
+  if (!isFinite(v)) return;
+  editor.smoothing = Math.min(1, Math.max(0, v));
+  if (document.activeElement !== $('smoothing')) $('smoothing').value = String(editor.smoothing);
+  $('smoothingVal').textContent = editor.smoothing.toFixed(2);
+}
+$('smoothing').addEventListener('input', (e) => setSmoothing(parseFloat(e.target.value)));
+
+// It cleans up a stroke when the pen comes off the canvas, and that is all it does — so under
+// the other two tools it is a setting with nothing to act on, and the flyout leaves it out.
+function syncSmoothSection() {
+  const draw = editor.tool === 'draw';
+  $('smoothSection').hidden = !draw;
+  $('smoothRule').hidden = !draw;
+}
+
+// ---------- the rounding tool ----------
+// A mode, not a button that fires: the toolbar toggle opens a slider at the bottom of the canvas
+// that bends the corners of the wall being edited while you drag it — on the canvas and in the
+// 3D preview — and the mode closes again on Apply or Cancel. It works from all three tools,
+// on either wall of whichever shape is selected.
+function syncRoundBar() {
+  const on = editor.rounding, btn = $('roundToolBtn');
+  $('roundBar').hidden = !on;
+  document.querySelector('.canvas-wrap').classList.toggle('with-smooth', !!on);
+  btn.setAttribute('aria-pressed', String(!!on));
+  btn.disabled = !on && !editor.canRound;
+  const wall = editor.active === 'inner' ? 'inner wall' : 'outer wall';
+  setTip(btn, btn.disabled
+    ? 'Round corners — draw a wall first, then this bends its corners.'
+    : on
+      ? 'Round corners — close the slider and leave the shape as it was.'
+      : `Round corners — bend the corners of the ${wall} of this shape. A slider comes up at the bottom of the canvas and the shape follows it as you drag; nothing is settled until you press Apply.`);
+  if (!on) return;
+  $('roundName').textContent = editor.layerCount > 1 ? `Round shape ${editor.index + 1} · ${wall}` : `Round ${wall}`;
+  setField('roundRange', on.amount);
+  $('roundNow').textContent = on.amount.toFixed(2);
+  setTip($('roundLabel'), on.kind === 'anchors'
+    ? 'How round the corners are — left leaves them sharp, right bends them into a full curve. The corners you placed stay where they are and keep their handles, so you can still move them afterwards. A curve bulges past its corner, so the shape grows a little as you slide.'
+    : 'How round the corners are — left leaves this outline as it is, right cuts its corners back into a smooth line. It has far too many points to be a set of corners, so it is smoothed as a line rather than curved corner by corner.');
+}
+
+$('roundToolBtn').addEventListener('click', () => {
+  if (editor.rounding) { editor.cancelRound(); return; }
+  if (editor.beginRound() === null) return;
+  syncRoundBar();
+  $('roundRange').focus();
+});
+$('roundRange').addEventListener('input', (e) => {
+  editor.setRound(parseFloat(e.target.value));
+  $('roundNow').textContent = (editor.rounding?.amount ?? 0).toFixed(2);
+});
+// The slider has focus while you are using it, and the canvas shortcuts stay out of a focused
+// input — so the two keys that close the mode are answered here as well. The arrow keys are the
+// slider's own, and nudge the rounding like any other range.
+$('roundRange').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); $('roundApplyBtn').click(); }
+  else if (e.key === 'Escape') { e.preventDefault(); editor.cancelRound(); }
+  e.stopPropagation();
+});
+$('roundApplyBtn').addEventListener('click', () => {
+  if (editor.applyRound()) toast('Corners rounded. Undo puts them back.');
+});
+$('roundCancelBtn').addEventListener('click', () => editor.cancelRound());
+
 $('centerBtn').addEventListener('click', () => editor.center());
 $('flipXBtn').addEventListener('click', () => editor.flip('x'));
 $('flipYBtn').addEventListener('click', () => editor.flip('y'));
 $('clearBtn').addEventListener('click', () => editor.clear());
-$('roundBtn').addEventListener('click', () => { if (editor.points.length >= 3) editor.roundCorners(); else toast('Nothing to round yet — draw or select a wall first.'); });
 $('undoBtn').addEventListener('click', () => editor.undo());
 $('redoBtn').addEventListener('click', () => editor.redo());
 
@@ -430,7 +590,7 @@ document.addEventListener('pointerdown', (e) => {
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setAlignMenu(false); });
 
-// symmetry
+// symmetry — a setting of the shape you are editing, not of the plate
 function syncSymmetry() {
   editor.setSymmetry({ x: $('symXBtn').getAttribute('aria-pressed') === 'true', y: $('symYBtn').getAttribute('aria-pressed') === 'true' });
   setTool(editor.tool);
@@ -496,6 +656,13 @@ document.addEventListener('keydown', (e) => {
     const [dx, dy] = ARROWS[e.key], step = e.shiftKey ? 5 : 1;   // millimetres
     editor.nudgePoint(dx * step, dy * step);
   }
+  else if (ARROWS[e.key] && editor.tool === 'move' && !editor.rounding) {
+    e.preventDefault();
+    const [dx, dy] = ARROWS[e.key], step = e.shiftKey ? 5 : 1;   // millimetres
+    editor.nudgeShape(dx * step, dy * step);
+  }
+  else if (e.key === 'Enter' && editor.rounding) { e.preventDefault(); $('roundApplyBtn').click(); }
+  else if (e.key === 'Escape' && editor.rounding) { e.preventDefault(); editor.cancelRound(); }
   else if (e.key === 'Escape') { editor.selectPoint(-1); closeMenu(); }
 });
 
@@ -513,12 +680,18 @@ const PARAM_INPUTS = {
   pRidgeWidth: 'ridgeWidth', pRidgeHeight: 'ridgeHeight',
   pBridgeCount: 'bridgeCount', pBridgeWidth: 'bridgeWidth', pBridgeAngle: 'bridgeAngle',
 };
-// Push the current params back into their inputs (after opening a project).
+// Push the active shape's params back into their inputs (on a shape switch, or after opening
+// a project). The box being typed in is left alone, so switching shapes mid-edit cannot swallow
+// a half-typed number from under the cursor.
 function syncParamInputs() {
-  for (const [id, key] of Object.entries(PARAM_INPUTS)) $(id).value = params[key];
+  for (const [id, key] of Object.entries(PARAM_INPUTS)) {
+    const el = $(id);
+    if (document.activeElement !== el) el.value = params[key];
+  }
   $('pRidge').checked = params.ridge;
   $('ridgeFields').hidden = !params.ridge;
   $('pMirror').checked = params.mirror;
+  $('bridgeAutoBtn').setAttribute('aria-pressed', String(editor.layer.bridgeAuto));
 }
 
 for (const [id, key] of Object.entries(PARAM_INPUTS)) {
@@ -529,7 +702,7 @@ for (const [id, key] of Object.entries(PARAM_INPUTS)) {
     if (!isFinite(v)) return;
     if (v <= 0 && !['bridgeCount', 'bridgeAngle'].includes(key)) return;
     params[key] = key === 'bridgeCount' ? Math.max(0, Math.round(v)) : v;
-    if (key === 'bridgeWidth' && bridgeAuto) { bridgeAuto = false; $('bridgeAutoBtn').setAttribute('aria-pressed', 'false'); }
+    if (key === 'bridgeWidth' && editor.layer.bridgeAuto) { editor.layer.bridgeAuto = false; $('bridgeAutoBtn').setAttribute('aria-pressed', 'false'); }
     onParamsChanged();
   });
 }
@@ -540,7 +713,7 @@ $('pMirror').addEventListener('change', (e) => setMirror(e.target.checked));
 
 function onParamsChanged() {
   drawProfile();
-  ringsKey = ''; editor.requestRender();
+  editor.requestRender();     // the wall bands are keyed on the settings, so they redraw by themselves
   scheduleRegen();
 }
 
@@ -733,7 +906,7 @@ window.addEventListener('scroll', (e) => {
   if (!presetMenu.hidden && !presetMenu.contains(e.target)) placePresetMenu();
 }, true);
 
-// ---------- upload (SVG outline, or a whole cutter from an STL) ----------
+// ---------- import (SVG outline, or a whole cutter from an STL) ----------
 const isSTL = (file) => /\.stl$/i.test(file.name) || file.type === 'model/stl';
 
 let pendingSvg = null;
@@ -745,15 +918,19 @@ $('svgInput').addEventListener('change', async (e) => {
     const text = await file.text();
     const res = await importSVG(text);
     pendingSvg = { res, name: file.name };
-    const b = bounds(res.points);
+    // The size asked for is the size of the whole drawing; the shapes in it keep their places
+    // and their proportions within it.
+    const b = res.bounds;
     let w = b.width, h = b.height;
     if (!res.physical || Math.max(w, h) > 400 || Math.max(w, h) < 5) { const s = 80 / Math.max(w, h); w *= s; h *= s; }
     svgSize.ratio = b.height / b.width;
     $('svgWidth').value = w.toFixed(1); $('svgHeight').value = h.toFixed(1);
-    $('svgDialogNote').textContent = res.physical
+    const found = res.shapes.length > 1
+      ? ` ${res.shapes.length} separate shapes were found; each becomes a cutter of its own.`
+      : res.shapes[0].inner ? ' Outer and inner wall found.' : '';
+    $('svgDialogNote').textContent = (res.physical
       ? `${file.name} specifies a physical size (${b.width.toFixed(1)} × ${b.height.toFixed(1)} mm). Change it if needed.`
-      : `${file.name} has no physical size, so 80 mm wide is suggested. Set the size you want.`
-      + (res.inner ? ' Outer and inner wall found.' : '');
+      : `${file.name} has no physical size, so 80 mm wide is suggested. Set the size you want.`) + found;
     $('svgDialog').showModal();
     $('svgWidth').focus(); $('svgWidth').select();
   } catch (err) {
@@ -767,30 +944,154 @@ $('svgDialog').addEventListener('submit', (e) => {
   if (!pendingSvg) return;
   const { res, name } = pendingSvg; pendingSvg = null;
   $('svgDialog').close();
-  const b = bounds(res.points);
+  const b = res.bounds;
   const w = parseFloat($('svgWidth').value), h = parseFloat($('svgHeight').value);
   const sx = w > 0 ? w / b.width : 1, sy = h > 0 ? h / b.height : sx;
-  const f = p => ({ x: p.x * sx, y: p.y * sy });
-  const outer = res.points.map(f), inner = res.inner ? res.inner.map(f) : null;
+  // Centre the whole drawing on the canvas, keeping the shapes where they sit inside it.
+  const f = p => ({ x: (p.x - b.cx) * sx, y: (p.y - b.cy) * sy });
+  const shapes = res.shapes.map(sh => ({ outer: sh.outer.map(f), inner: sh.inner ? sh.inner.map(f) : [] }));
   let msg = `Imported ${name} at ${(b.width * sx).toFixed(1)} × ${(b.height * sy).toFixed(1)} mm`;
-  if (inner) msg += ' — outer and inner wall';
-  if (res.holes > 1) msg += ` (${res.holes} holes, using the largest)`;
-  if (res.pieces > 1) msg += ` (${res.pieces} separate shapes, using the largest)`;
-  if (editor.active === 'inner' && !inner) {
-    editor.setPoints(outer, { record: true });
+  if (shapes.length > 1) msg += ` — ${shapes.length} shapes`;
+  else if (shapes[0].inner.length) msg += ' — outer and inner wall';
+  if (res.extraHoles) msg += ` (${res.extraHoles} extra hole${res.extraHoles === 1 ? '' : 's'} left out — one inner wall per shape)`;
+  if (editor.active === 'inner' && shapes.length === 1 && !shapes[0].inner.length) {
+    editor.setPoints(shapes[0].outer, { record: true });
   } else {
-    editor.setShape({ outer, inner: inner || [] }, { record: true, center: true });
+    editor.setLayers(shapes);
     setActive('outer');
   }
   setTool('move');
   toast(msg + '.');
+  setTimeout(warnIfClashing, 1200);   // after the "imported" message has had its turn
 });
+
+// ---------- the shapes on this plate ----------
+// One entry per shape, at the canvas' top left. The one you pick is the one you draw on and the
+// one the settings panel belongs to; the rest stay on the canvas in grey. All of them are built
+// into the 3D preview and downloaded together, because that is what comes off the printer.
+const shapesList = $('shapesList');
+
+// A thumbnail of one outline, so two shapes in the list can be told apart at a glance. Drawn
+// from the outline itself, thinned down to what a 22 px picture can show.
+function shapeThumb(outer, inner) {
+  if (!outer || outer.length < 3) {
+    return '<svg class="thumb blank" viewBox="0 0 22 22" aria-hidden="true">'
+      + '<path d="M4 4h14v14H4z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-dasharray="3 3" /></svg>';
+  }
+  const b = bounds(outer), box = Math.max(b.width, b.height, 0.001) * 1.14;
+  const r = (v) => Math.round(v * 100) / 100;
+  const ring = (pts) => {
+    const t = simplify(pts.concat([pts[0]]), box / 90);
+    return 'M' + t.map(q => `${r(q.x)} ${r(q.y)}`).join('L') + 'Z';
+  };
+  let d = ring(outer);
+  if (inner && inner.length >= 3) d += ring(inner);
+  const vb = `${r(b.cx - box / 2)} ${r(b.cy - box / 2)} ${r(box)} ${r(box)}`;
+  return `<svg class="thumb" viewBox="${vb}" aria-hidden="true">`
+    + `<path d="${d}" fill-rule="evenodd" vector-effect="non-scaling-stroke" /></svg>`;
+}
+
+// Adding or removing a shape, or stepping to another one, redraws the list at once; a thumbnail
+// that is only changing because a shape is being dragged waits for the drag to stop. Without that
+// the list would be rebuilt sixty times a second, outline simplification and all.
+let listShape = '', listTimer = 0;
+function renderShapeList() {
+  const sig = `${editor.layers.length}|${editor.index}`;
+  const structural = sig !== listShape;
+  listShape = sig;
+  clearTimeout(listTimer);
+  if (structural) drawShapeList();
+  else listTimer = setTimeout(drawShapeList, 200);
+}
+
+function drawShapeList() {
+  const list = editor.layerList();
+  const many = list.length > 1;
+  shapesList.textContent = '';
+  for (const l of list) {
+    const name = `Shape ${l.index + 1}`;
+    const row = document.createElement('div');
+    row.className = 'shape-row';
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', String(l.active));
+    row.dataset.index = String(l.index);
+    row.innerHTML = `<button type="button" class="shape-pick">${shapeThumb(l.outer, l.inner)}<span class="nm"></span></button>`
+      + '<button type="button" class="btn ghost small icon shape-del"><i class="ph ph-trash"></i></button>';
+    row.querySelector('.nm').textContent = l.drafting ? `${name} — unfinished` : l.empty ? `${name} — empty` : name;
+    const pick = row.querySelector('.shape-pick');
+    setTip(pick, l.active
+      ? `${name} — the shape you are working on. Its size, walls and connections are what the settings panel shows.`
+      : `${name} — switch to this shape. The one you are on now goes grey and cannot be moved until you come back.`);
+    const del = row.querySelector('.shape-del');
+    del.hidden = !many;
+    setTip(del, `Delete ${name} — take this shape off the plate, settings and all. You can undo it.`);
+    shapesList.append(row);
+  }
+  $('settingsScope').hidden = !many;
+  $('settingsScopeName').textContent = `Shape ${editor.index + 1}`;
+  // Another empty shape beside an empty one is nothing; finish this one first.
+  const add = $('addShapeBtn');
+  add.disabled = !editor.hasOuter;
+  setTip(add, add.disabled
+    ? 'Add shape — draw this shape first. Every shape on the plate is a cutter of its own.'
+    : 'Add shape — another cutter on the same plate, with its own size, walls and settings.');
+}
+
+shapesList.addEventListener('click', (e) => {
+  const row = e.target.closest('.shape-row');
+  if (!row) return;
+  const i = Number(row.dataset.index);
+  if (e.target.closest('.shape-del')) deleteShape(i);
+  else if (!row.matches('[aria-selected="true"]')) { editor.setLayer(i); toast(`Shape ${i + 1} — the others are greyed out until you come back.`); }
+});
+
+$('addShapeBtn').addEventListener('click', () => {
+  editor.addLayer();
+  setActive('outer');
+  setShapesOpen(true);
+  toast(`Shape ${editor.index + 1} added — draw it clear of the others. It keeps its own size, walls and settings.`);
+});
+
+// A file puts its shapes where it wants them, which may be closer together than a printer can
+// keep apart. Nothing is moved — the arrangement is the file's — but it is worth saying.
+function warnIfClashing() {
+  const bad = editor.clashingLayers();
+  if (!bad.length) return;
+  const names = bad.map(i => i + 1).join(', ');
+  toast(`Shapes ${names} are touching or overlapping. Move them apart, or they will print as one piece.`);
+}
+
+async function deleteShape(i) {
+  const list = editor.layerList();
+  if (list.length < 2) return;
+  if (!list[i].empty) {
+    const ok = await confirmAction(`Delete shape ${i + 1}?`,
+      'It comes off the plate with its own size, walls and settings. You can undo this.', 'Delete');
+    if (!ok) return;
+  }
+  editor.removeLayer(i);
+  toast('Shape deleted.');
+}
+
+// On a phone the list would take a bite out of the canvas, so it folds away behind its header
+// and follows the width of the window — until you fold or unfold it yourself, after which it
+// stays the way you left it.
+function setShapesOpen(open) {
+  $('shapesToggle').setAttribute('aria-expanded', String(open));
+  shapesList.hidden = !open;
+}
+const narrowScreen = window.matchMedia('(max-width: 760px)');
+let shapesFoldedByHand = false;
+const followScreenWidth = () => { if (!shapesFoldedByHand) setShapesOpen(!narrowScreen.matches); };
+$('shapesToggle').addEventListener('click', () => { shapesFoldedByHand = true; setShapesOpen(shapesList.hidden); });
+narrowScreen.addEventListener('change', followScreenWidth);
+followScreenWidth();
 
 // ---------- point selection bar & context menu ----------
 function updatePointBar(sel) {
   const bar = $('pointBar');
-  if (!sel || editor.tool !== 'points') { bar.hidden = true; $('toolTip').style.visibility = ''; return; }
-  $('toolTip').style.visibility = 'hidden';
+  if (!sel || editor.tool !== 'points') { bar.hidden = true; return; }
+  setToolTipOpen(false);   // a tip tapped open on touch has no business over the point bar
   const p = sel.point, curved = !!(p.in || p.out);
   $('pointLabel').textContent = `Point ${sel.index + 1} of ${editor.points.length}`;
   $('ptCurveBtn').hidden = curved;
@@ -832,11 +1133,36 @@ function readHandleField(which) {
 ['ptX', 'ptY', 'ptInX', 'ptInY', 'ptOutX', 'ptOutY'].forEach(id => {
   $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } e.stopPropagation(); });
 });
+
 $('ptCurveBtn').addEventListener('click', () => editor.setCurve(editor.selected, 'add'));
 $('ptResetBtn').addEventListener('click', () => editor.setCurve(editor.selected, 'reset'));
 $('ptRemoveCurveBtn').addEventListener('click', () => editor.setCurve(editor.selected, 'remove'));
 $('ptSyncBtn').addEventListener('click', () => editor.setSmooth(editor.selected, $('ptSyncBtn').getAttribute('aria-pressed') !== 'true'));
 $('ptDeleteBtn').addEventListener('click', () => editor.deletePoint());
+
+// ---------- shape position bar ----------
+// The same idea as the point bar, for the shape the Move tool is holding: where it sits, so a
+// cutter can be placed by number instead of by eye. It reads the middle of the wall being
+// edited — the box the move handles are drawn on.
+function updateShapeBar() {
+  const bar = $('shapeBar');
+  const pos = editor.tool === 'move' ? editor.shapePos : null;
+  if (!pos) { bar.hidden = true; return; }
+  $('shapeBarLabel').textContent = editor.active === 'inner' ? 'Inner wall'
+    : editor.layerCount > 1 ? `Shape ${editor.index + 1}` : 'Shape';
+  setField('shX', pos.x); setField('shY', pos.y);
+  bar.hidden = false;
+}
+
+function readShapeFields() {
+  editor.moveShapeTo(parseFloat($('shX').value), parseFloat($('shY').value));
+  updateShapeBar();   // a move a neighbour refused must not leave the box claiming it happened
+}
+['shX', 'shY'].forEach(id => {
+  $(id).addEventListener('change', readShapeFields);
+  // Enter commits without leaving the box, and the arrow keys are the spinner's, not the canvas'.
+  $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); } e.stopPropagation(); });
+});
 
 function openPointMenu(info) {
   const m = $('ctxMenu');
@@ -881,10 +1207,9 @@ let clayColor = '#c8714a';
 $('resultBtn').addEventListener('click', openResult);
 
 function openResult() {
-  const shape = editor.getShape();
-  if (shape.outer.length < 3) { toast('Draw a shape first — then you can see the piece it cuts.'); return; }
-  const s = editor.getSize();
-  $('resultSize').textContent = `${s.width.toFixed(1)} × ${s.height.toFixed(1)} mm`;
+  const b = editor.allBounds();
+  if (!b) { toast('Draw a shape first — then you can see the piece it cuts.'); return; }
+  $('resultSize').textContent = `${b.width.toFixed(1)} × ${b.height.toFixed(1)} mm`;
   syncResultMirror();
   resultDlg.showModal();
   renderResult();
@@ -908,9 +1233,10 @@ function setClayColor(hex) {
   renderResult();
 }
 
-// Mirror is one setting with two switches: the checkbox under Export and the button in the popup.
+// Mirror is one setting with two switches: the checkbox under Export and the button in the
+// popup. It turns over the whole plate, so it is the one wall setting every shape shares.
 function setMirror(on) {
-  params.mirror = on;
+  for (const l of editor.layers) l.params.mirror = on;
   $('pMirror').checked = on;
   onParamsChanged();
   syncResultMirror();
@@ -919,7 +1245,7 @@ function setMirror(on) {
 $('resultMirrorBtn').addEventListener('click', () => setMirror(!params.mirror));
 
 function syncResultMirror() {
-  const row = $('resultMirror'), matters = mirrorMatters(editor.getShape());
+  const row = $('resultMirror'), matters = mirrorMatters();
   row.hidden = !matters;
   if (!matters) return;   // a shape that is its own mirror image comes out the same either way
   $('resultMirrorText').textContent = params.mirror
@@ -932,9 +1258,14 @@ function syncResultMirror() {
 // mirror image — the two results are then the same piece, turned round. Only the two obvious
 // axes are tested, and anything the test cannot settle counts as "it matters", so the sentence
 // is never withheld from a shape that really does come out back-to-front.
-function mirrorMatters(shape) {
-  if (shape.outer.length < 3) return false;
+// With more than one shape it always matters: mirroring turns the whole plate over, so the
+// shapes swap sides even when each of them is its own mirror image.
+function mirrorMatters() {
+  const drawn = editor.layerList().filter(l => !l.empty);
+  if (!drawn.length) return false;
+  if (drawn.length > 1) return true;
   if (editor.sym.x || editor.sym.y) return false;
+  const shape = { outer: drawn[0].outer, inner: drawn[0].inner };
   try { return !(sameAfterFlip(shape, 'x') || sameAfterFlip(shape, 'y')); } catch { return true; }
 }
 
@@ -974,15 +1305,16 @@ function renderResult() {
   top.addColorStop(0, '#2b2e3e'); top.addColorStop(1, '#14161f');
   ctx.fillStyle = top; ctx.fillRect(0, 0, w, h);
 
-  const shape = editor.getShape();
-  if (shape.outer.length < 3) return;
+  // Every shape on the plate, in the places they sit in — this is what the cutter leaves behind.
+  const drawn = editor.layerList().filter(l => !l.empty);
+  if (!drawn.length) return;
   // The face that meets the clay. A cutter is used upside-down, so unless the model is mirrored
   // already the piece is a mirror image of the drawing. It is turned over left–right rather than
   // top–bottom: the two differ only by turning the piece round on the table, and the sideways one
   // keeps the drawing the right way up, so what you see is the mirroring and nothing else.
   const face = (pts) => pts.map(p => ({ x: params.mirror ? p.x : -p.x, y: p.y }));
-  const outer = face(shape.outer), inner = shape.inner.length >= 3 ? face(shape.inner) : null;
-  const b = bounds(outer);
+  const pieces = drawn.map(l => ({ outer: face(l.outer), inner: l.inner.length >= 3 ? face(l.inner) : null }));
+  const b = bounds(pieces.map(pc => pc.outer).flat());
   const scale = Math.min(w / Math.max(b.width, 0.001), h / Math.max(b.height, 0.001)) * 0.76;
   const depth = Math.max(4, Math.min(16, Math.min(w, h) * 0.04));   // apparent thickness of the slab
   const toPx = (p) => ({ x: w / 2 + (p.x - b.cx) * scale, y: h / 2 - depth / 2 + (p.y - b.cy) * scale });
@@ -991,7 +1323,10 @@ function renderResult() {
     for (let i = 1; i < pts.length; i++) { const q = toPx(pts[i]); ctx.lineTo(q.x, q.y); }
     ctx.closePath();
   };
-  const piece = () => { ctx.beginPath(); path(outer); if (inner) path(inner); };
+  const piece = () => {
+    ctx.beginPath();
+    for (const pc of pieces) { path(pc.outer); if (pc.inner) path(pc.inner); }
+  };
 
   // a second copy pushed down behind the top face gives the piece a cut edge and a shadow
   ctx.save();
@@ -1012,7 +1347,7 @@ function renderResult() {
   // A browser without canvas filters simply gets the unblurred band.
   ctx.filter = `blur(${(depth * 0.6).toFixed(1)}px)`;
   ctx.lineWidth = depth * 1.6; ctx.strokeStyle = 'rgba(0, 0, 0, 0.2)'; ctx.lineJoin = 'round';
-  ctx.beginPath(); path(outer); if (inner) path(inner); ctx.stroke();
+  piece(); ctx.stroke();
   ctx.filter = 'none';
   const sheen = ctx.createRadialGradient(w * 0.34, h * 0.28, 0, w * 0.34, h * 0.28, Math.max(w, h) * 0.62);
   sheen.addColorStop(0, 'rgba(255, 255, 255, 0.16)'); sheen.addColorStop(1, 'rgba(255, 255, 255, 0)');
@@ -1069,6 +1404,8 @@ drawProfile();
 $('ridgeFields').hidden = !params.ridge;
 $('secInnerWrap').hidden = true;
 updateHint(editor.getShape());
+shownLayer = editor.layer.id;
+renderShapeList();
 
 // ---------- edits 3 & 4: chrome wiring (flyout, collapsible sections, summaries) ----------
 
@@ -1086,7 +1423,6 @@ document.addEventListener('pointerdown', (e) => {
   if (!flyout.contains(e.target) && !flyoutBtn.contains(e.target)) setFlyout(false);
 });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !flyout.hidden) setFlyout(false); });
-$('smoothing').addEventListener('input', (e) => { $('smoothingVal').textContent = parseFloat(e.target.value).toFixed(2); });
 
 // Collapsible settings sections.
 document.querySelectorAll('.sec-head').forEach(head => {
@@ -1114,7 +1450,7 @@ editor.canvas.addEventListener('pointerup', () => setTimeout(refreshSummaries, 0
 refreshSummaries();
 
 // handy for debugging in the browser console
-window.cutter = { editor, viewer, params };
+window.cutter = { editor, viewer, get params() { return editor.params; }, get layers() { return editor.layers; } };
 
 // ---------- explanation tooltips ----------
 // Icon-only buttons carry no label, so what they do has to be spelled out somewhere. Native

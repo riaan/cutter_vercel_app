@@ -1,9 +1,10 @@
-// Turns an SVG file into a single closed outline in millimetres.
+// Turns an SVG file into closed outlines in millimetres — one per separate shape in the file,
+// so a sheet of four charms comes in as four shapes to cut.
 // Strategy: render the SVG off-screen, sample every geometry element with the
 // browser's own path engine (so curves, arcs and transforms are all handled),
-// split into loops, union them, and keep the largest region.
+// split into loops, and sort them into outlines and the holes that sit inside them.
 
-import { unionPolygons, cleanPolygon, bounds, isInside, signedArea } from './geometry.js';
+import { cleanPolygon, bounds, isInside, signedArea } from './geometry.js';
 
 const PX_PER_MM = 96 / 25.4;
 
@@ -78,23 +79,23 @@ export async function importSVG(text) {
     const cleaned = loops.map(l => cleanPolygon(l, 0.0005)).filter(Boolean)
       .sort((a, b) => Math.abs(signedArea(b)) - Math.abs(signedArea(a)));
     if (!cleaned.length) throw new Error('The SVG shapes have no area — they need to be closed outlines.');
-    // Largest loop is the outline. Loops inside it are holes (the largest becomes the
-    // inner wall); loops outside it are merged into the outline.
-    const largest = cleaned[0];
-    const holes = [], extra = [];
-    for (const l of cleaned.slice(1)) (isInside(l, largest) ? holes : extra).push(l);
-    const merged = unionPolygons([largest, ...extra]);
-    if (!merged.length) throw new Error('Could not combine the SVG shapes.');
-    const outline = cleanPolygon(merged[0], 0.0005);
-    const inner = holes.length ? holes[0] : null;
-    const b = bounds(outline);
+    // Biggest first, so anything that lands inside an outline already taken is a hole in it.
+    // A loop that is inside nothing starts a shape of its own — that is the sheet of charms.
+    const shapes = [];
+    let extraHoles = 0;
+    for (const l of cleaned) {
+      const host = shapes.find(sh => isInside(l, sh.outer));
+      if (!host) { shapes.push({ outer: l, inner: null }); continue; }
+      if (host.inner) extraHoles++;          // only one hole per shape becomes an inner wall
+      else host.inner = l;
+    }
+    const b = bounds(shapes.map(sh => sh.outer).flat());
     return {
-      points: outline,
-      inner,
-      pieces: merged.length,
-      holes: holes.length,
+      shapes,
+      extraHoles,
       physical: hasPhysical,
       size: { width: b.width, height: b.height },
+      bounds: b,
     };
   } finally {
     host.remove();

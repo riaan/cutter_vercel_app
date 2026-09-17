@@ -7,12 +7,16 @@
 //   preview-3d.png  the 3D view
 // The previews and the STL are there for you and your file browser; they are never read back.
 // The mesh is rebuilt from project.json, which is what keeps a reopened project identical.
+//
+// A project holds a list of shapes (layers), each with its own contours, mirror settings and
+// wall parameters. A schema-1 file held a single shape with the parameters alongside it; it is
+// read back as a plate with one shape on it.
 
 import { DEFAULT_PARAMS } from './geometry.js';
 import { zipWrite, zipRead } from './zip.js';
 
 export const PROJECT_FORMAT = 'cutter-project';
-export const PROJECT_SCHEMA = 1;
+export const PROJECT_SCHEMA = 2;
 export const PROJECT_EXT = '.cutter';
 
 const num = (v, fallback) => (typeof v === 'number' && isFinite(v) ? v : fallback);
@@ -29,24 +33,33 @@ function cleanPoint(p) {
 }
 const cleanRing = (pts) => (Array.isArray(pts) ? pts.map(cleanPoint) : []);
 
+const cleanLayer = (l) => ({
+  shape: { outer: cleanRing(l?.shape?.outer), inner: cleanRing(l?.shape?.inner) },
+  sym: { x: !!l?.sym?.x, y: !!l?.sym?.y },
+  symOrigin: { x: num(l?.symOrigin?.x, 0), y: num(l?.symOrigin?.y, 0) },
+  params: { ...DEFAULT_PARAMS, ...(l?.params || {}) },
+  // Which contours were still being drawn — a line of corners nobody has closed yet. A file
+  // saved before this existed has none, and reads back as the finished shapes it held.
+  open: { outer: !!l?.open?.outer, inner: !!l?.open?.inner },
+  bridgeAuto: !!l?.bridgeAuto,
+});
+
 // state → the plain object that is written as project.json.
 export function serializeProject(state) {
-  const p = { ...DEFAULT_PARAMS, ...(state.params || {}) };
+  const layers = (Array.isArray(state.layers) && state.layers.length ? state.layers : [state]).map(cleanLayer);
   return {
     format: PROJECT_FORMAT,
     schema: PROJECT_SCHEMA,
     app: 'Cutter',
     savedAt: new Date().toISOString(),
     name: state.name || 'cutter',
-    shape: { outer: cleanRing(state.shape?.outer), inner: cleanRing(state.shape?.inner) },
-    sym: { x: !!state.sym?.x, y: !!state.sym?.y },
+    shapes: layers,
+    index: Math.min(Math.max(0, Math.round(state.index) || 0), layers.length - 1),
     active: state.active === 'inner' ? 'inner' : 'outer',
     tool: ['draw', 'points', 'move'].includes(state.tool) ? state.tool : 'draw',
     smoothing: num(state.smoothing, 0.4),
     lockAspect: state.lockAspect !== false,
     grid: { size: num(state.grid?.size, 10), snap: !!state.grid?.snap },
-    params: p,
-    bridgeAuto: !!state.bridgeAuto,
     // Only for the "does it still build the same" check on open — never fed back into geometry.
     stats: state.stats || null,
   };
@@ -57,19 +70,21 @@ export function serializeProject(state) {
 export function deserializeProject(data) {
   if (!data || data.format !== PROJECT_FORMAT) throw new Error('That is not a Cutter project file.');
   if (!(data.schema <= PROJECT_SCHEMA)) throw new Error('This project was saved by a newer version of Cutter. Update the page and try again.');
-  const outer = cleanRing(data.shape?.outer);
-  if (outer.length < 2) throw new Error('This project has no shape in it.');
+  // Schema 1 kept one shape and its parameters at the top level; it becomes a plate of one.
+  const raw = Array.isArray(data.shapes) && data.shapes.length
+    ? data.shapes
+    : [{ shape: data.shape, sym: data.sym, params: data.params, bridgeAuto: data.bridgeAuto }];
+  const layers = raw.map(cleanLayer).filter(l => l.shape.outer.length >= 2);
+  if (!layers.length) throw new Error('This project has no shape in it.');
   return {
     name: typeof data.name === 'string' ? data.name : 'cutter',
-    shape: { outer, inner: cleanRing(data.shape?.inner) },
-    sym: { x: !!data.sym?.x, y: !!data.sym?.y },
+    layers,
+    index: Math.min(Math.max(0, Math.round(data.index) || 0), layers.length - 1),
     active: data.active === 'inner' ? 'inner' : 'outer',
     tool: ['draw', 'points', 'move'].includes(data.tool) ? data.tool : 'move',
     smoothing: num(data.smoothing, 0.4),
     lockAspect: data.lockAspect !== false,
     grid: { size: num(data.grid?.size, 10), snap: !!data.grid?.snap },
-    params: { ...DEFAULT_PARAMS, ...(data.params || {}) },
-    bridgeAuto: !!data.bridgeAuto,
     stats: data.stats || null,
     savedAt: data.savedAt || null,
   };

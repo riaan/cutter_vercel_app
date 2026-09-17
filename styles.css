@@ -96,6 +96,24 @@ body {
 .pane-title { color: var(--faint); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
 
 .canvas-wrap, .viewer-wrap { position: relative; flex: 1; min-height: 0; background: var(--sunken); }
+/* How much room the drawing pane and its canvas have depends on which panels are switched on,
+   not on the size of the window, so what sits inside them asks them rather than the screen.
+   Named, because they are nested: a rule for one must never resolve against the other. Nothing
+   inside either is position: fixed, which is the one thing a container would otherwise catch. */
+.canvas-wrap { container: canvas / inline-size; }
+.pane-draw { container: drawpane / inline-size; }
+/* Sooner than clip a button off the end, the row of shape actions takes a second line — but it
+   is the last resort, not the plan: the row grows by four buttons the moment the first corner
+   goes down, and a toolbar that gains a line there shoves the canvas out from under the pointer
+   mid-gesture. So the words the icons beside them already say come off well before it fills up. */
+.toolbar.sub { flex-wrap: wrap; }
+@container drawpane (max-width: 700px) {
+  .toolbar.sub .seg-label { display: none; }
+  #canvasSetupBtn span, #canvasSetupBtn .ph-caret-down { display: none; }
+}
+@container drawpane (max-width: 560px) {
+  .toolbar.sub .segmented.small .seg span { display: none; }
+}
 .canvas-wrap { min-height: 320px; }
 #drawCanvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
 #viewer { position: absolute; inset: 0; cursor: grab; }
@@ -119,26 +137,35 @@ body {
    Listed first, the corner variant's display: block beat this and the hint stayed on
    screen with the hidden attribute set. */
 .hint[hidden] { display: none; }
+/* Top left of the canvas: the shapes on this plate. */
+.canvas-tl {
+  position: absolute; left: 11.2px; top: 11.2px; z-index: 5;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+  max-width: calc(100% - 22.4px); max-height: calc(100% - 22.4px);
+  pointer-events: none;   /* the canvas keeps every pixel the controls do not use */
+}
 /* How the current tool works. It shows itself for a few seconds after you pick a tool, then
    slides back behind its (i), which brings it out again on hover — the canvas is the thing
-   people came for, so the explanation does not sit on top of it forever. */
-.tool-tip {
-  position: absolute; left: 11.2px; top: 11.2px; z-index: 4;
-  display: flex; align-items: flex-start; gap: 6px; max-width: calc(100% - 22.4px);
-  pointer-events: none;   /* only the (i) takes the pointer; the canvas keeps the rest */
-}
+   people came for, so the explanation does not sit on top of it forever. The (i) lives in the
+   toolbar, right beside the three tools it explains. */
+.tool-tip { display: inline-flex; align-items: center; flex: none; }
+/* No frame around it: the glyph already reads as an (i), and a second ring next to the tool
+   buttons would look like a fourth one. It keeps a 32 px box so it is still a touch target. */
 .tt-icon {
-  flex: none; pointer-events: auto; cursor: help;
+  flex: none; cursor: help;
   display: inline-flex; align-items: center; justify-content: center;
-  width: 28px; height: 28px; padding: 0; border: 0; border-radius: 50%;
-  color: #b2b6ca; background: rgba(35, 37, 50, 0.92); box-shadow: inset 0 0 0 1px var(--line);
+  width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%;
+  color: #b2b6ca; background: transparent; box-shadow: none;
 }
-.tt-icon i { font-size: 16px; }
-.tool-tip:not(.collapsed) .tt-icon, .tt-icon:hover { color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.tt-icon i { font-size: 21px; }
+.tool-tip:not(.collapsed) .tt-icon, .tt-icon:hover { color: var(--accent); }
+/* The text floats under the icon and is placed by app.js, so opening it never moves the
+   toolbar and it can never run off the side of a narrow window. */
 .tt-text {
-  max-width: 34ch; padding: 6px 9px; border-radius: var(--radius);
+  position: fixed; z-index: 25; pointer-events: none;
+  max-width: 34ch; padding: 7px 10px; border-radius: var(--radius);
   color: #b2b6ca; font-size: 12px; line-height: 1.45;
-  background: rgba(35, 37, 50, 0.92); box-shadow: inset 0 0 0 1px var(--line);
+  background: var(--paper); box-shadow: var(--shadow-md), inset 0 0 0 1px var(--line);
   /* Clipped rather than resized, so the words never reflow while it slides. */
   transition: clip-path 0.3s ease, opacity 0.22s ease, transform 0.3s ease;
 }
@@ -234,6 +261,9 @@ body {
 .flyout-head { display: flex; align-items: center; gap: 8.4px; }
 .flyout-head .group-label { margin-right: auto; }
 .flyout section { display: flex; flex-direction: column; gap: 5.6px; }
+/* Must come after it: an author's display beats the hidden attribute whatever the specificity,
+   so a section switched off in app.js would otherwise stay on screen. */
+.flyout section[hidden] { display: none; }
 .flyout .row-btns { display: flex; gap: 5.6px; flex-wrap: wrap; }
 .sec-body .row-btns { display: flex; gap: 5.6px; flex-wrap: wrap; }
 .flyout .note { margin: 0; }
@@ -384,6 +414,9 @@ body {
   font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent);
 }
 .point-bar[hidden] { display: none; }
+/* the same bar for the shape the Move tool is holding: one row, whose shape it is then x and y */
+#shapeBar .point-fields { padding: 2px 4px; }
+#shapeBar .field-label { margin-right: 10px; color: var(--accent); }
 .ctx-menu {
   position: fixed; z-index: 30; background: var(--paper); box-shadow: var(--shadow-md);
   border-radius: var(--radius); padding: 4px; min-width: 190px; display: flex; flex-direction: column;
@@ -555,6 +588,44 @@ body {
   fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round;
 }
 
+/* ---------- the rounding tool's slider, bottom centre of the canvas ----------
+   Only on screen while the mode is, so it takes a line of its own above the grid and zoom
+   controls rather than squeezing between them: a bar floating over the drawing is what says
+   a mode is open and waiting for Apply or Cancel. */
+.canvas-smooth {
+  position: absolute; left: 50%; transform: translateX(-50%); bottom: 56px; z-index: 6;
+  display: flex; align-items: center; gap: 5.6px; max-width: calc(100% - 22.4px);
+  background: var(--paper); box-shadow: var(--shadow-md); border-radius: var(--radius); padding: 5.6px;
+}
+.canvas-smooth[hidden] { display: none; }
+.cs-slider {
+  display: flex; align-items: center; gap: 7px; min-height: 32px; padding: 0 10px;
+  background: var(--sunken); border-radius: var(--radius); box-shadow: inset 0 0 0 1px var(--hairline);
+  color: var(--muted); font-size: 11px; cursor: pointer;
+}
+.cs-slider i { font-size: 14px; color: var(--faint); }
+.cs-name { white-space: nowrap; }
+.cs-slider input { width: 132px; accent-color: var(--accent); cursor: pointer; }
+.cs-val { min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; color: var(--accent); }
+.view-btn.primary {
+  color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent);
+}
+.view-btn.primary:hover { background: var(--accent); color: var(--paper); }
+/* The zoom menu opens upwards over this row; the bar yields to it the way the hint does. */
+.canvas-wrap.zooming .canvas-smooth { opacity: 0; pointer-events: none; }
+.canvas-smooth { transition: opacity 0.12s ease; }
+@media (prefers-reduced-motion: reduce) { .canvas-smooth { transition: none; } }
+/* With the bar on screen both hints move up, so neither sits on top of it. */
+.canvas-wrap.with-smooth .hint.corner { inset: auto 0 108px 0; }
+.canvas-wrap.with-smooth .hint:not(.corner) { padding-bottom: 100px; }
+/* Its name is the first thing to go when the canvas is narrow: the toolbar button is pressed
+   and the shape is bending under the slider, so what this is is not in doubt. */
+@container canvas (max-width: 560px) {
+  .cs-name { display: none; }
+  .cs-slider input { width: 104px; }
+  .canvas-smooth #roundApplyBtn span, .canvas-smooth #roundCancelBtn span { display: none; }
+}
+
 /* ---------- canvas grid control (bottom left, where the scale bar used to be painted) ---------- */
 .canvas-grid {
   position: absolute; left: 11.2px; bottom: 11.2px; z-index: 4;
@@ -608,3 +679,70 @@ body {
 
 /* Shape actions only appear once there is a shape; the divider in front of them goes too. */
 .toolbar-group .divider[hidden] { display: none; }
+
+
+/* ---------- the shapes on this plate ---------- */
+/* One cutter per row. The one you pick is the one you can draw on and the one the settings
+   panel belongs to; the others stay on the canvas in grey and are built along with it. */
+.shapes-panel {
+  pointer-events: auto; min-width: 0; max-width: 100%;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: rgba(35, 37, 50, 0.92); box-shadow: inset 0 0 0 1px var(--line);
+  border-radius: var(--radius);
+}
+.shapes-head { display: flex; align-items: center; gap: 2px; padding: 3px; }
+.shapes-toggle {
+  display: inline-flex; align-items: center; gap: 5px; flex: 1; min-width: 0;
+  font: inherit; font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); background: none; border: 0; border-radius: 6px; cursor: pointer;
+  padding: 4px 6px; min-height: 26px;
+}
+.shapes-toggle:hover { color: var(--ink); background: rgba(233, 233, 237, 0.06); }
+.shapes-toggle .caret { font-size: 12px; margin-left: auto; transition: transform 0.15s ease; }
+.shapes-toggle[aria-expanded="false"] .caret { transform: rotate(-90deg); }
+@media (prefers-reduced-motion: reduce) { .shapes-toggle .caret { transition: none; } }
+.shapes-list {
+  display: flex; flex-direction: column; gap: 2px; padding: 0 3px 3px;
+  max-height: 208px; overflow: auto; overscroll-behavior: contain;
+}
+.shapes-list[hidden] { display: none; }
+.shape-row { display: flex; align-items: center; gap: 2px; }
+.shape-pick {
+  display: inline-flex; align-items: center; gap: 7px; flex: 1; min-width: 0;
+  font: inherit; font-size: 12px; color: var(--muted); text-align: left;
+  background: none; border: 0; border-radius: 6px; cursor: pointer; padding: 4px 6px; min-height: 32px;
+}
+.shape-pick:hover { background: rgba(233, 233, 237, 0.06); color: var(--ink); }
+.shape-row[aria-selected="true"] .shape-pick { color: var(--accent); background: var(--accent-soft); }
+.shape-pick .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shape-pick .thumb { flex: none; width: 22px; height: 22px; display: block; }
+.shape-pick .thumb path { fill: currentColor; fill-opacity: 0.22; stroke: currentColor; stroke-width: 1.4; stroke-linejoin: round; }
+.shape-pick .thumb.blank { opacity: 0.45; }
+.shape-del { flex: none; opacity: 0; transition: opacity 0.12s ease; }
+.shape-row:hover .shape-del, .shape-row[aria-selected="true"] .shape-del, .shape-del:focus-visible { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .shape-del { transition: none; } }
+.shape-del[hidden] { display: none; }
+/* No hover on a touch screen, so the trash button cannot hide behind one. */
+@media (hover: none) { .shape-del { opacity: 1; } }
+
+/* Which shape the settings below belong to. */
+.settings-scope {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 2px;
+  padding: 7px 9px; border-radius: var(--radius); font-size: 12px; color: var(--muted);
+  background: var(--accent-soft); box-shadow: inset 0 0 0 1px rgba(145, 132, 217, 0.35);
+}
+.settings-scope[hidden] { display: none; }
+.settings-scope i { font-size: 14px; color: var(--accent); }
+.settings-scope b { color: var(--ink); font-weight: 600; }
+
+@media (max-width: 760px) {
+  /* On a phone the list would eat the canvas; it starts folded and the header stays. */
+  .shapes-list { max-height: 148px; }
+  .shape-pick { font-size: 11px; }
+  .canvas-tl { gap: 4px; }
+  /* The position bar shares the top of the canvas with that folded list, so it puts the shape's
+     name on a line of its own rather than squeezing the two boxes. */
+  #shapeBar .point-fields .field-group { display: block; text-align: right; }
+  #shapeBar .field-label { display: block; margin: 0 0 4px; }
+  #shapeBar .point-fields label + label { margin-left: 6px; }
+}

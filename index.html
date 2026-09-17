@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Cutter — draw a shape, print it</title>
-  <meta name="description" content="Draw or upload a shape and download a 3D-printable cutter (STL)." />
+  <meta name="description" content="Draw or import a shape and download a 3D-printable cutter (STL)." />
   <meta name="color-scheme" content="dark" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -58,10 +58,17 @@
           <button class="seg" data-tool="points" role="tab" aria-selected="false"><i class="ph ph-vector-two"></i><span>Points</span></button>
           <button class="seg" data-tool="move" role="tab" aria-selected="false"><i class="ph ph-arrows-out-cardinal"></i><span>Move</span></button>
         </div>
+        <!-- How the tool you have just picked works: it reads itself out for a few seconds, then
+             tucks back into the (i), which brings it out again on hover (tap on touch). The text
+             floats under the icon (app.js › placeToolTip), so the toolbar never moves for it. -->
+        <div class="tool-tip collapsed" id="toolTip">
+          <button type="button" class="tt-icon" id="toolTipIcon" aria-label="How this tool works" aria-expanded="false" aria-controls="toolTipText"><i class="ph ph-info"></i></button>
+          <span class="tt-text" id="toolTipText" role="status"></span>
+        </div>
         <span class="spacer"></span>
         <div class="toolbar-group">
-          <label class="btn ghost file" title="Upload — bring in an outline from an SVG, or rebuild a whole cutter from an STL you made earlier. It replaces what you have drawn.">
-            <i class="ph ph-upload-simple"></i>Upload
+          <label class="btn ghost file" title="Import — bring in an outline from an SVG, or rebuild a whole cutter from an STL you made earlier. It replaces what you have drawn.">
+            <i class="ph ph-upload-simple"></i>Import
             <input type="file" id="svgInput" accept=".svg,image/svg+xml,.stl,model/stl" hidden />
           </label>
           <div class="preset-picker">
@@ -106,9 +113,13 @@
           <button class="btn ghost small icon" id="flipXBtn" title="Flip left–right — mirror the shape horizontally, as if held up to a mirror. The size stays the same."><i class="ph ph-arrows-horizontal"></i></button>
           <button class="btn ghost small icon" id="flipYBtn" title="Flip top–bottom — mirror the shape vertically. The size stays the same."><i class="ph ph-arrows-vertical"></i></button>
           <span class="divider" id="shapeActionsDivider"></span>
+          <!-- Rounding is a mode of its own: press this and a slider comes up at the bottom of
+               the canvas that bends the corners of the wall you are editing while you drag it.
+               Nothing is settled until Apply, and Cancel puts the shape back. -->
+          <button class="btn ghost small icon toggle" id="roundToolBtn" aria-pressed="false" aria-controls="roundBar" disabled><i class="ph ph-wave-sine"></i></button>
           <!-- edit 3: one button for everything that used to fill the bottom bar -->
           <button class="btn ghost small toggle" id="canvasSetupBtn" aria-pressed="false" aria-expanded="false" aria-controls="canvasFlyout">
-            <i class="ph ph-sliders-horizontal"></i>Canvas<i class="ph ph-caret-down"></i>
+            <i class="ph ph-sliders-horizontal"></i><span>Canvas</span><i class="ph ph-caret-down"></i>
           </button>
           <button class="btn ghost small icon danger" id="clearBtn" title="Clear — remove the whole drawing and start over. You can undo this."><i class="ph ph-trash"></i></button>
         </div>
@@ -117,11 +128,22 @@
       <div class="canvas-wrap">
         <canvas id="drawCanvas" aria-label="Shape canvas"></canvas>
         <div class="hint" id="drawHint">
-          <p id="drawHintText"><strong>Draw the shape to cut.</strong> Drag to sketch — the outline closes and smooths itself. Or place corners one by one with <em>Points</em>, upload an SVG, or pick a starter shape.</p>
+          <p id="drawHintText"><strong>Draw the shape to cut.</strong> Drag to sketch — the outline closes and smooths itself. Or place corners one by one with <em>Points</em>, import an SVG, or pick a starter shape.</p>
         </div>
-        <div class="tool-tip collapsed" id="toolTip">
-          <button type="button" class="tt-icon" id="toolTipIcon" aria-label="How this tool works" aria-expanded="false" aria-controls="toolTipText"><i class="ph ph-info"></i></button>
-          <span class="tt-text" id="toolTipText" role="status"></span>
+        <!-- Top left: the shapes on this plate, and under them the explanation of the tool
+             you are holding. One shape is active — the others stay visible but cannot be
+             picked up, and all of them are built into the 3D preview and the STL. -->
+        <div class="canvas-tl">
+          <div class="shapes-panel" id="shapesPanel">
+            <div class="shapes-head">
+              <button type="button" class="shapes-toggle" id="shapesToggle" aria-expanded="true" aria-controls="shapesList"
+                      title="Shapes — everything on this plate. Pick one to work on it; the rest stay on the canvas, greyed out.">
+                <i class="ph ph-stack-simple"></i><span>Shapes</span><i class="ph ph-caret-down caret"></i>
+              </button>
+              <button type="button" class="btn ghost small icon" id="addShapeBtn" title="Add shape — another cutter on the same plate, with its own size, walls and settings."><i class="ph ph-plus"></i></button>
+            </div>
+            <div class="shapes-list" id="shapesList" role="listbox" aria-label="Shapes on this plate"></div>
+          </div>
         </div>
 
         <!-- grid: bottom left of the canvas, with the scale bar it replaces -->
@@ -135,6 +157,20 @@
             <option value="20">20 mm</option>
           </select>
           <span class="scale-bar" aria-hidden="true"><i id="scaleTick"></i><em id="scaleLabel">10 mm</em></span>
+        </div>
+
+        <!-- Bottom centre, only while the rounding tool is on: drag the slider and the corners
+             of the wall you are editing bend with it, on this canvas and in the 3D preview.
+             It is a preview until Apply; Cancel puts the shape back the way it was. -->
+        <div class="canvas-smooth" id="roundBar" hidden role="group" aria-label="Round corners">
+          <label class="cs-slider" id="roundLabel">
+            <i class="ph ph-wave-sine" aria-hidden="true"></i>
+            <span class="cs-name" id="roundName">Round corners</span>
+            <input type="range" id="roundRange" min="0" max="1" step="0.01" value="0" aria-label="How round the corners are" />
+            <span class="cs-val" id="roundNow">0.00</span>
+          </label>
+          <button class="view-btn primary" id="roundApplyBtn"><i class="ph ph-check"></i><span>Apply</span></button>
+          <button class="view-btn" id="roundCancelBtn"><i class="ph ph-x"></i><span>Cancel</span></button>
         </div>
 
         <!-- view controls: zoom + pan, bottom right of the canvas -->
@@ -188,6 +224,17 @@
           </div>
         </div>
 
+        <!-- where the shape sits, while the Move tool is on; arrow keys step it by 1 mm -->
+        <div class="point-bar" id="shapeBar" hidden>
+          <div class="point-fields">
+            <span class="field-group" title="Where the middle of this shape sits on the canvas — x to the right, y downwards, from the middle of the canvas. Arrow keys move it by 1 mm (5 mm with Shift); hold Shift while dragging to keep it on one line.">
+              <span class="field-label" id="shapeBarLabel">Shape</span>
+              <label>x<input type="number" id="shX" step="0.1" /></label>
+              <label>y<input type="number" id="shY" step="0.1" /></label>
+            </span>
+          </div>
+        </div>
+
         <!-- edit 3: the flyout — same ids as the old assist bar, so app.js needs no rewiring -->
         <div class="flyout" id="canvasFlyout" hidden>
           <div class="flyout-head">
@@ -195,16 +242,18 @@
             <button class="btn ghost small icon" id="canvasFlyoutClose" title="Close this panel"><i class="ph ph-x"></i></button>
           </div>
 
-          <section>
-            <label class="slider" title="How much a freehand sketch is cleaned up when you lift the pen: left keeps every wobble and sharp corner, right turns it into a smooth curve. Also sets how strongly 'Round corners' works.">
+          <!-- Belongs to the pen and to nothing else: it is what a freehand stroke is cleaned up
+               by when you lift it. So it is only here while the Draw tool is the one in hand —
+               app.js › syncSmoothSection(). Rounding a shape already drawn is the wave button. -->
+          <section id="smoothSection">
+            <label class="slider" title="How much a freehand sketch is cleaned up when you lift the pen: left keeps every wobble and sharp corner, right turns it into a smooth curve. It only affects strokes you draw by hand; rounding a shape you have already drawn is the wave button in the toolbar.">
               <span class="row"><span>Sketch smoothing</span><span class="val" id="smoothingVal">0.40</span></span>
               <input type="range" id="smoothing" min="0" max="1" step="0.05" value="0.4" />
               <span class="ends"><span>Keep wobbles</span><span>Smooth curve</span></span>
             </label>
-            <button class="btn ghost small" id="roundBtn" title="Round the corners of the selected wall (imports and point-drawn shapes too). Strength follows the smoothing slider."><i class="ph ph-bezier-curve"></i>Round corners of this wall</button>
           </section>
 
-          <hr />
+          <hr id="smoothRule" />
 
           <section role="group" aria-label="Symmetry">
             <span class="group-label">Mirror</span>
@@ -255,6 +304,12 @@
     <!-- Settings — edit 4: every h2 is now a collapsible section head -->
     <aside class="pane pane-settings" aria-label="Settings">
 
+      <!-- Which shape these settings belong to. Every shape on the plate carries its own size,
+           walls and connections; only Export below is shared by all of them. -->
+      <div class="settings-scope" id="settingsScope" hidden>
+        <i class="ph ph-stack-simple"></i><span>Settings for <b id="settingsScopeName">Shape 1</b></span>
+      </div>
+
       <div class="sec">
         <button class="sec-head" type="button" data-sec="size" aria-expanded="true" aria-controls="secSize">
           <i class="ph ph-caret-right caret"></i><span class="name">Size</span><span class="summary" id="sumSize">—</span>
@@ -273,7 +328,7 @@
               <span class="unit"><input type="number" id="heightInput" min="5" max="400" step="0.5" inputmode="decimal" /><em>mm</em></span>
             </label>
           </div>
-          <p class="note">Size of the cut piece. The cutter is a little bigger because of the base.</p>
+          <p class="note">Size of the cut piece of this shape. The cutter is a little bigger because of the base.</p>
         </div>
       </div>
 
@@ -322,7 +377,7 @@
           <label class="field"><span>File name</span><span class="unit"><input type="text" id="fileName" value="cutter" maxlength="60" /><em>.stl</em></span></label>
           <label class="check">
             <input type="checkbox" id="pMirror" />
-            <span>Mirror the model <span class="aside">— for letters and other asymmetric shapes, so the cut piece matches the drawing (a cutter is used upside-down)</span></span>
+            <span>Mirror the model <span class="aside">— for letters and other asymmetric shapes, so the cut piece matches the drawing (a cutter is used upside-down). It turns over the whole plate.</span></span>
           </label>
           <p class="note boxed"><i class="ph ph-printer"></i><span>Print with the wide base on the bed, no supports. PLA or PETG, 0.2 mm layers, 3–4 walls.</span></p>
           <div class="row-btns">

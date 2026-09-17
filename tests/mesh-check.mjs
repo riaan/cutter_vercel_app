@@ -47,12 +47,27 @@ const fixed = [
 // at the size they are inserted at, which is the tight one (a 3 mm base on a 30 mm shape is
 // a different problem from a 3 mm base on a 70 mm one), and at the size they are drawn.
 const { PRESETS, PRESET_SIZE_MM } = await import(path.join(root, 'js/presets.js'));
-const { flatten, mapPts } = await import(path.join(root, 'js/editor.js'));
+const { flatten, mapPts, curveCorners } = await import(path.join(root, 'js/editor.js'));
 for (const [key, p] of Object.entries(PRESETS)) {
   const pts = p.make(), b = G.bounds(flatten(pts)), s = PRESET_SIZE_MM / Math.max(b.width, b.height);
   const at = (k) => G.cleanPolygon(flatten(mapPts(pts, q => ({ x: q.x * k, y: q.y * k }))), 0.002);
   fixed.push([`starter shape: ${key} at ${PRESET_SIZE_MM} mm`, at(s), {}]);
   fixed.push([`starter shape: ${key} as drawn`, at(1), {}]);
+}
+
+// Rounding the corners of a point-drawn shape curves the anchors where they stand, so what
+// reaches the builder is a handful of cubics rather than a traced polyline. The extreme of the
+// slider is the one worth checking: the handles are half the way to the next corner, which is
+// as far as a curve can bulge before it starts to fold back on itself.
+{
+  const square = [{ x: -25, y: -25 }, { x: 25, y: -25 }, { x: 25, y: 25 }, { x: -25, y: 25 }];
+  const tri = [{ x: 0, y: -30 }, { x: 26, y: 15 }, { x: -26, y: 15 }];
+  for (const [name, pts] of [['square', square], ['triangle', tri]]) {
+    for (const strength of [0.2, 0.5]) {
+      const rounded = G.cleanPolygon(flatten(curveCorners(pts, strength)), 0.002);
+      fixed.push([`rounded corners: ${name} at ${strength}`, rounded, {}]);
+    }
+  }
 }
 
 let failed = 0;
@@ -62,6 +77,46 @@ for (const [label, shape, params] of fixed) {
   const ok = r.open === 0 && r.nonManifold === 0;
   if (!ok) failed++;
   console.log(`${ok ? 'PASS' : 'FAIL'} ${label}: ${r.triangles} triangles, ${r.open} open, ${r.nonManifold} non-manifold, ${r.volume.toFixed(0)} mm³, ${Date.now() - t0} ms`);
+}
+
+// Several shapes on one plate. They never touch, so each one keeps its own edges and the whole
+// soup has to come out as watertight as its parts — with each shape built from its own settings.
+const at = (pts, dx, dy) => pts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+const plates = [
+  ['plate: two rings side by side', [
+    { shape: { outer: at(circ(20), -40, 0), inner: at(circ(10), -40, 0) }, params: {} },
+    { shape: { outer: at(circ(20), 40, 0), inner: at(circ(10), 40, 0) }, params: {} },
+  ]],
+  ['plate: three shapes, each its own settings', [
+    { shape: { outer: at(circ(18), -50, 0), inner: null }, params: { height: 12, bladeWidth: 0.5 } },
+    { shape: { outer: at(star, 0, 0), inner: at(circ(8), 0, 0) }, params: { height: 20, ridge: false, bridgeCount: 5 } },
+    { shape: { outer: at(circ(15), 55, 10), inner: null }, params: { height: 15, baseWidth: 4, baseHeight: 2 } },
+  ]],
+  ['plate: mirrored, two shapes', [
+    { shape: { outer: at(star, -45, 0), inner: at(circ(8), -45, 0) }, params: { mirror: true } },
+    { shape: { outer: at(circ(20), 45, 0), inner: null }, params: { mirror: true } },
+  ]],
+];
+for (const [label, parts] of plates) {
+  const res = G.buildAll(parts.map(p => ({ ...p, params: { ...G.DEFAULT_PARAMS, ...p.params } })));
+  const r = check(res);
+  const ok = r.open === 0 && r.nonManifold === 0 && res.parts.length === parts.length;
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'} ${label}: ${res.parts.length} shapes, ${r.triangles} triangles, ${r.open} open, ${r.nonManifold} non-manifold, ${r.volume.toFixed(0)} mm³`);
+}
+
+// A shape that cannot be built says which one it is, so the message points at a shape in the list.
+{
+  let msg = '';
+  try {
+    G.buildAll([
+      { label: 'Shape 1', shape: { outer: circ(20), inner: null }, params: { ...G.DEFAULT_PARAMS } },
+      { label: 'Shape 2', shape: { outer: circ(20), inner: at(circ(10), 100, 0) }, params: { ...G.DEFAULT_PARAMS } },
+    ]);
+  } catch (e) { msg = e.message; }
+  const ok = /^Shape 2: /.test(msg);
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'} plate: a bad shape is named ("${msg}")`);
 }
 
 // optional random stress: node tests/mesh-check.mjs 100

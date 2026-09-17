@@ -71,16 +71,20 @@ export function simplify(pts, tolerance) {
 }
 
 // Chaikin corner cutting on a closed polygon — turns a jagged sketch into a smooth curve.
-export function chaikin(pts, passes = 1, closed = true) {
+// `cut` is how far along each edge the two new points are placed. A quarter is the classic
+// Chaikin corner cut; anything less cuts the corner less deeply, which is what lets a slider
+// dial the rounding up and down smoothly instead of jumping a whole pass at a time.
+export function chaikin(pts, passes = 1, closed = true, cut = 0.25) {
   let out = pts;
+  const a = Math.min(0.5, Math.max(0, cut)), b = 1 - a;
   for (let k = 0; k < passes; k++) {
     const next = [];
     const n = out.length, m = closed ? n : n - 1;
     if (!closed) next.push(out[0]);
     for (let i = 0; i < m; i++) {
       const p = out[i], q = out[(i + 1) % n];
-      next.push({ x: 0.75 * p.x + 0.25 * q.x, y: 0.75 * p.y + 0.25 * q.y });
-      next.push({ x: 0.25 * p.x + 0.75 * q.x, y: 0.25 * p.y + 0.75 * q.y });
+      next.push({ x: b * p.x + a * q.x, y: b * p.y + a * q.y });
+      next.push({ x: a * p.x + b * q.x, y: a * p.y + b * q.y });
     }
     if (!closed) next.push(out[n - 1]);
     out = next;
@@ -90,11 +94,11 @@ export function chaikin(pts, passes = 1, closed = true) {
 
 // Round the corners of a contour: light simplification first (so dense outlines don't
 // explode in vertex count), then Chaikin corner cutting.
-export function roundCorners(pts, passes = 2, closed = true) {
+export function roundCorners(pts, passes = 2, closed = true, cut = 0.25) {
   if (!pts || pts.length < 3) return pts;
   const base = simplify(closed ? pts.concat([pts[0]]) : pts, 0.05);
   if (closed) base.pop();
-  return chaikin(base, passes, closed);
+  return chaikin(base, passes, closed, cut);
 }
 
 // Resolve self-intersections, drop tiny slivers, keep the largest region.
@@ -183,14 +187,22 @@ function pathsBounds(paths) {
   return { minX, minY, maxX, maxY, width: maxX - minX, height: maxY - minY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
 }
 
+// The mirror lines of a shape cross at its own origin, so a shape that is not sitting on the
+// canvas centre can still be drawn symmetrically. Both functions below work in that shape's
+// local frame and hand the result back in canvas coordinates.
+const ORIGIN = { x: 0, y: 0 };
+const shiftPts = (pts, dx, dy) => pts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+
 // Clip a polygon (mm) to a half-plane / quadrant and mirror it back — used by the
-// editor's symmetry mode. sym = { x: bool, y: bool }; editable region is x >= 0 / y <= 0.
-export function symmetrize(pts, sym) {
+// editor's symmetry mode. sym = { x: bool, y: bool }; editable region is x >= 0 / y <= 0,
+// measured from `origin`.
+export function symmetrize(pts, sym, origin = ORIGIN) {
   if (!pts || pts.length < 3 || (!sym.x && !sym.y)) return pts;
+  const local = shiftPts(pts, -origin.x, -origin.y);
   const BIG = 100000;
   const rect = (x0, y0, x1, y1) => [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }];
   const region = rect(sym.x ? 0 : -BIG, -BIG, BIG, sym.y ? 0 : BIG);
-  let paths = interI([toClip(pts)], [toClip(region)]);
+  let paths = interI([toClip(local)], [toClip(region)]);
   if (!paths.length) return null;
   const mirror = (ps, mx, my) => ps.map(p => p.map(q => ({ X: mx ? -q.X : q.X, Y: my ? -q.Y : q.Y })).reverse());
   if (sym.x) paths = unionI(paths, mirror(paths, true, false), false);
@@ -198,20 +210,21 @@ export function symmetrize(pts, sym) {
   const best = largestPath(paths);
   if (!best) return null;
   if (CL().Clipper.Area(best) < 0) best.reverse();
-  return fromClip(CL().Clipper.CleanPolygon(best, 0.002 * SCALE));
+  return shiftPts(fromClip(CL().Clipper.CleanPolygon(best, 0.002 * SCALE)), origin.x, origin.y);
 }
 
-// The editable part of a polygon in symmetry mode (x >= 0 / y <= 0), as one polygon
-// that starts and ends on the mirror line so it can be closed along the axes again.
-export function clipToRegion(pts, sym) {
+// The editable part of a polygon in symmetry mode (x >= 0 / y <= 0 from `origin`), as one
+// polygon that starts and ends on the mirror line so it can be closed along the axes again.
+export function clipToRegion(pts, sym, origin = ORIGIN) {
   if (!pts || pts.length < 3 || (!sym.x && !sym.y)) return pts;
+  const local = shiftPts(pts, -origin.x, -origin.y);
   const BIG = 100000;
   const region = [{ x: sym.x ? 0 : -BIG, y: -BIG }, { x: BIG, y: -BIG }, { x: BIG, y: sym.y ? 0 : BIG }, { x: sym.x ? 0 : -BIG, y: sym.y ? 0 : BIG }];
-  const best = largestPath(interI([toClip(pts)], [toClip(region)]));
+  const best = largestPath(interI([toClip(local)], [toClip(region)]));
   if (!best) return null;
   if (CL().Clipper.Area(best) < 0) best.reverse();
-  const out = fromClip(CL().Clipper.CleanPolygon(best, 0.002 * SCALE));
-  const onAxis = (p) => (sym.x && Math.abs(p.x) < 1e-6) || (sym.y && Math.abs(p.y) < 1e-6);
+  const out = shiftPts(fromClip(CL().Clipper.CleanPolygon(best, 0.002 * SCALE)), origin.x, origin.y);
+  const onAxis = (p) => (sym.x && Math.abs(p.x - origin.x) < 1e-6) || (sym.y && Math.abs(p.y - origin.y) < 1e-6);
   // rotate so the polygon starts at the last mirror-line vertex before the free part
   const n = out.length;
   for (let i = 0; i < n; i++) {
@@ -373,6 +386,49 @@ export function buildCutter(shape, params) {
   } finally {
     for (const o of trash) { try { o.delete(); } catch { /* already gone */ } }
   }
+}
+
+// Several cutters on one plate. Each shape is built on its own — they never touch, so the
+// triangle soups simply follow one another and the result is as watertight as its parts. The
+// shapes keep their places on the canvas, so the plate comes out arranged the way it is drawn.
+export function buildAll(parts) {
+  const built = [];
+  for (let i = 0; i < parts.length; i++) {
+    const { shape, params, label } = parts[i];
+    try {
+      built.push(buildCutter(shape, params));
+    } catch (e) {
+      // With one shape on the plate the message is about the only thing there is; with several
+      // it has to say which one, so it can be found in the shapes list.
+      throw new Error(parts.length > 1 ? `${label || `Shape ${i + 1}`}: ${e.message}` : e.message);
+    }
+  }
+  if (!built.length) throw new Error('Draw a closed shape first.');
+  if (built.length === 1) return { ...built[0], parts: built };
+
+  let n = 0;
+  for (const b of built) n += b.positions.length;
+  const positions = new Float32Array(n);
+  let at = 0;
+  for (const b of built) { positions.set(b.positions, at); at += b.positions.length; }
+
+  const acc = (key, f) => built.reduce((v, b) => f(v, b.bounds[key]), f === Math.min ? Infinity : -Infinity);
+  const bb = {
+    minX: acc('minX', Math.min), maxX: acc('maxX', Math.max),
+    minY: acc('minY', Math.min), maxY: acc('maxY', Math.max),
+    minZ: 0, maxZ: acc('maxZ', Math.max),
+  };
+  bb.width = bb.maxX - bb.minX; bb.height = bb.maxY - bb.minY;
+  bb.cx = (bb.minX + bb.maxX) / 2; bb.cy = (bb.minY + bb.maxY) / 2;
+  return {
+    positions,
+    parts: built,
+    triangles: built.reduce((t, b) => t + b.triangles, 0),
+    bounds: bb,
+    piece: { width: bb.width, height: bb.height },
+    footprint: { width: bb.width, height: bb.height, height3d: bb.maxZ },
+    volumeMm3: built.reduce((v, b) => v + b.volumeMm3, 0),
+  };
 }
 
 // Bar rectangles (mm polygons, CCW) radiating from the inner shape's centre.
