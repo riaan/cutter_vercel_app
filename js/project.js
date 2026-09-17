@@ -44,6 +44,9 @@ const cleanLayer = (l) => ({
   // saved before this existed has none, and reads back as the finished shapes it held.
   open: { outer: !!l?.open?.outer, inner: !!l?.open?.inner },
   bridgeAuto: !!l?.bridgeAuto,
+  // Locked out of reach on the canvas. It is how the drawing was left, like the mirror settings,
+  // so it comes back with it; a file saved before this existed has every shape free.
+  locked: !!l?.locked,
 });
 
 // state → the plain object that is written as project.json.

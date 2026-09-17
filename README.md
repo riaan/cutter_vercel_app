@@ -17,6 +17,31 @@ no accounts — everything runs in the browser.
   whole plate, so what you see is what comes off the printer. By default shapes may not touch:
   while you drag one it stops against its neighbour, and a stroke drawn on top of another shape is
   refused, so two cutters never fuse into one piece by accident.
+- **Working on several shapes at once**: with the Move tool, hold ⌘ (Ctrl on Windows) and click to
+  add a shape to the ones you are holding or take it back out, or hold Shift and drag a rectangle
+  round the ones you want. *Select all* at the foot of the shapes list (⌘A) holds the whole plate;
+  a click on empty canvas, or Escape, puts everything down. It is the Move tool's: picking up Draw
+  or Points goes back to the one shape you are working on, and the buttons for holding several are
+  not in the panel under those tools. The shapes you are holding are drawn in
+  colour with one dashed box round them, and they move together — by dragging, with the arrow keys,
+  or by typing a position. *Center* puts them in the middle of the canvas keeping their places
+  relative to each other, the two *Align* buttons line them up on one horizontal or vertical line,
+  *Flip* mirrors the whole arrangement, and *Reset* in the settings panel puts the settings of all
+  of them back to the standard ones at once. Resizing and rotating stay one shape at a time —
+  every cutter has a size of its own.
+- **Arrange**: lays every shape out again in tidy rows in the middle of the canvas, clear of each
+  other, biggest first — for when a plate has grown into a mess. Locked shapes stay where they are,
+  nothing is rotated, and *Allow overlap* goes off, since that is what keeps the shapes apart. You
+  can undo the move.
+- **Locking a shape**: the padlock in its row puts a shape out of reach — it cannot be selected,
+  moved, drawn on or deleted, and *Select all*, the rectangle and *Arrange* all pass it by. On the
+  canvas it turns a cool blue-grey, dashed, with a small padlock at its corner, so you can see at a
+  glance which shapes are out of reach — and it is still in the 3D preview and in the STL, so a
+  finished cutter can sit on the plate while you work on the next one without ever being nudged by
+  accident. Locking a shape lets go of it: any corner or box you had on it disappears with it. With
+  several shapes held, the row under *Select all* locks the lot in one press — and turns into
+  *Unlock all*, so the next press gives them straight back. That one stays whatever tool you are
+  holding, so a lock can always be opened from where you are. The lock is saved with the project.
 - **Letting shapes overlap**: *Allow overlap*, at the foot of the shapes list once there are two
   shapes on the plate, lets them run into each other instead of stopping against their neighbours — two hearts sharing a lobe, a letter
   leaning on the next. Where they do overlap they come out as **one merged object**, in the 3D
@@ -44,7 +69,15 @@ no accounts — everything runs in the browser.
   without moving and you get a plain sharp corner. Shift keeps the pull to 45° steps. It is how
   a smooth outline is drawn in one pass — place, pull, place, pull — and it works the same
   whether you place the corner on the canvas or on the outline of a shape you have already drawn.
-  (Dragging a corner that was already there still moves it, as before.) The arrow keys nudge the selected corner by 1 mm
+  (Dragging a corner that was already there still moves it, as before.)
+  **Hold Alt (Option on a Mac) and pull a corner** to draw that same curve again on a corner that
+  is already there — the one you want to bend is usually one you placed a while ago. The corner
+  stays put and the pull draws its curve from scratch: whatever handles it had are replaced, so
+  the same gesture turns a sharp corner round, re-aims a curve you are not happy with, or (pulled
+  back to nothing) takes the curve off again. The cursor turns into a + over a corner while Alt
+  is held. It is one undo step, and letting go without pulling leaves the corner exactly as it
+  was. To adjust one side of a curve on its own, drag the tip of that handle instead.
+  The arrow keys nudge the selected corner by 1 mm
   (5 mm with Shift), and holding Shift while dragging keeps it on one straight line —
   horizontal or vertical for a corner, also diagonal for a curve handle. The bar at the
   canvas' top right shows the exact position of the corner (and of its curve handles),
@@ -101,10 +134,10 @@ no accounts — everything runs in the browser.
   magnet to the mirror line and the other side follows live. Switching a mirror on or off reshapes
   what is already drawn, so it asks first (and it can be undone).
 - **Which wall the buttons act on**: *Editing* decides. They only appear once the wall you are
-  editing has a shape. On the outer wall, *Clear* and the two
-  *Flip* buttons act on the shape you are editing, inner wall included, and *Center* moves the
-  whole drawing to the middle of the canvas — every shape together, so they keep their places
-  relative to each other. On the inner wall they act on the inner wall alone; *Center* is off
+  editing has a shape. On the outer wall, *Clear* acts on the shape you are editing, inner wall
+  included, while *Center* and the two *Flip* buttons act on the shapes you are **holding** — one
+  of them, or several together (press *Select all* to move the whole plate as one). On the inner
+  wall they act on the inner wall alone; *Center* is off
   and *Align* takes its place — nine spots (corners, sides, middle) to line the inner wall up
   against the outer shape.
 - **Grid & snapping**: at the canvas' bottom left, next to the scale bar. Grid size 1–20 mm; with
@@ -130,8 +163,9 @@ no accounts — everything runs in the browser.
   row at the top of the settings panel says how many, and *Reset all* puts the whole shape back
   at once; it first shows you a list of what changes, from what to what, so you can say no. This
   is mostly for a cutter opened from an STL, where every number was measured off the model and
-  can be a long way from where a shape you draw starts. It only ever touches the shape you are
-  on, never the drawing or its size. The settings panel shows one shape at a time, so the shapes
+  can be a long way from where a shape you draw starts. It never touches the drawing or its size —
+  only the settings of the shape you are on, or of every shape you are holding, and then the list
+  shows what changes with a heading per shape. The settings panel shows one shape at a time, so the shapes
   list on the canvas carries the same arrow beside the name of every shape that is off the
   standard settings — including the ones you are not looking at. It is a marker, not a button:
   tapping it takes you to that shape, where the settings are.

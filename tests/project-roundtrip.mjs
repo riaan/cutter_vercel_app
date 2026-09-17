@@ -165,6 +165,25 @@ for (const [name, layers] of cases) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  an unfinished outline comes back unfinished`);
 }
 
+// A shape locked out of reach on the canvas has to come back locked: it is how the drawing was
+// left, and a plate that reopened with every shape free would invite exactly the edit the lock
+// was put there to prevent.
+{
+  const state = {
+    layers: [
+      { shape: { outer: circ(30), inner: [] }, sym: { x: false, y: false }, symOrigin: { x: 0, y: 0 }, params: {}, bridgeAuto: false, locked: true },
+      { shape: { outer: at(circ(20), 70, 0), inner: [] }, sym: { x: false, y: false }, symOrigin: { x: 0, y: 0 }, params: {}, bridgeAuto: false },
+    ],
+    index: 1, active: 'outer', tool: 'move', smoothing: 0.4, lockAspect: true,
+    grid: { size: 10, snap: false }, name: 'locked-one',
+  };
+  const bytes = P.packProject(state);
+  const back = await P.unpackProject(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  const ok = back.layers.length === 2 && back.layers[0].locked === true && back.layers[1].locked === false;
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  a locked shape comes back locked`);
+}
+
 // The zip must also be a zip: entry names and the STL come back intact.
 const { zipRead } = await import(path.join(root, 'js/zip.js'));
 const probe = P.packProject({ layers: [{ shape: { outer: circ(20), inner: [] }, sym: { x: false, y: false }, params: {} }], name: 'probe' },

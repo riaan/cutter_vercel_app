@@ -60,10 +60,12 @@ need http); this is documented and expected.
 ```
 user input ──► ShapeEditor (js/editor.js)
                  layers = [ { id, rev, shape: { outer, inner }, sym, symOrigin, params,
-                              open: { outer, inner }, bridgeAuto } ]
+                              open: { outer, inner }, bridgeAuto, locked } ]
                  index  = the layer being edited; this.shape / this.sym / this.symOrigin /
                           this.params / this.points are accessors onto it, so the rest of the
                           editor reads as if there were only ever one shape
+                 sel    = the layer ids the Move tool is holding (`selection` as indexes);
+                          `index` is the anchor and is always one of them while anything is held
                  getShape()   → the effective *active* shape (curves flattened, symmetry applied)
                  buildParts() → every layer, effective, each with its own params
                         │ onChange(activeShape, { selectionOnly })
@@ -122,9 +124,43 @@ user input ──► ShapeEditor (js/editor.js)
   mirror turns the whole plate over and is never per shape, and then reads the overlap setting off
   the drawing like any other file.
 - Undo covers the whole plate. `_snapshot()` keeps every layer's contours, mirror and `symOrigin`,
-  which layer was active and which wall — so adding and deleting a shape are undoable too. Wall
-  settings have no undo of their own, so `_restore()` keeps the settings a still-existing layer
-  has *now* (matched by `id`) and only restores those of a layer being brought back.
+  which layer was active, which wall and which shapes were held — so adding and deleting a shape
+  are undoable too, and undoing a group move does not put the shapes down. Wall settings and the
+  lock have no undo of their own, so `_restore()` keeps the settings and the lock a still-existing
+  layer has *now* (matched by `id`) and only restores those of a layer being brought back.
+- **Several shapes at once.** `editor.sel` is a set of layer ids: what the Move tool is holding.
+  `selection` gives them as indexes, `selectionCount` / `multi` say how many, and `picked` is what
+  it always was — is the shape being edited in hand? `_hold()` collapses the set to the active
+  layer and is what everything that changes which shape that is calls; `selectShape(i, mode)`
+  ('only' | 'toggle' | 'add'), `selectAll()`, `selectInRect()` and `dropShape()` are the ways in.
+  **More than one shape is the Move tool's**: `canHoldMany` is `tool === 'move'`, and the three
+  operations that would build a set fall back to a single shape without it, so no other route can
+  leave a drawing tool holding two. `setTool()` collapses the set on the way out of Move and
+  reports it (`_changed({ selectionOnly: true })`), so the shapes list, the position bar and the
+  Align buttons follow the tool the moment it changes.
+  A group transform goes through `_groupStart()` → `_applyGroupTransform(start, f)` (f is handed
+  the point *and* its layer, so Align can move each shape by its own amount) and is taken back
+  whole by `_groupAllowed()` when it would run into a shape outside the selection — the same guard
+  as for one shape, asked of the group. `_runSelection()` wraps that in one undo step and, where
+  the action changes how the selected shapes sit among themselves (Align), compares
+  `clashingLayers()` before and after and takes the whole thing back rather than merging them.
+  `centerSelection()`, `alignSelection('h'|'v')`, `flipSelection('x'|'y')` and `arrangeShapes()`
+  are the actions; `_mirrorLayer()` is how a flip treats one layer, and a symmetric shape mirrored
+  about a line parallel to its own mirror line is *moved* instead (the shape is already its own
+  mirror image that way, so its seed and its handles survive).
+- **A locked layer** (`l.locked`) is out of reach: `_layerAt()` looks through it, `selectAll()`,
+  `selectInRect()` and `setLayer()` pass it by, and every mutator asks `_editable()` first, which
+  refuses with a sentence instead of a merged or reshaped cutter. `lockLayer(i, on)` is the one
+  way in (`lockLayers(indexes, on)` is the same thing for several at once, settling the anchor once
+  at the end); locking the shape being edited lets go of it — out of the selection, and `_select(-1)`
+  for the corner that was selected on it — and steps the anchor to the first shape that is not
+  locked, so the settings panel is showing a shape you are allowed to change (a project file whose
+  active shape was locked opens the same way). With *every* shape locked there is nowhere to step,
+  and then `_render()`'s `frozen` branch is what keeps the canvas honest: the shape being edited is
+  drawn by `_renderOther()` like any other shape that cannot be touched, and the corners, the
+  Bézier handles, the move box, the draft line and the full-contrast wall bands are all left off
+  it. `arrangeShapes()` treats locked shapes as fixed obstacles and puts the block it packs
+  beside them.
 - `setLayer()` reports `onChange(..., { selectionOnly: true })`: stepping to another shape changes
   no solid, so app.js updates the panel and skips the rebuild.
 
@@ -222,7 +258,9 @@ pictures are there for the user's file browser and slicer.
 `project.json` (schema 2) carries `shapes`: one entry per layer with its **seed** contours (with
 Bézier handles — in symmetry mode the edited half, exactly as stored), its `sym`, its `symOrigin`,
 all `DEFAULT_PARAMS`, its `open` flags (an outline left unfinished reopens unfinished, instead of
-becoming a closed cutter nobody drew) and its `bridgeAuto` flag. Alongside it: which shape was active (`index`), the
+becoming a closed cutter nobody drew), its `bridgeAuto` flag and its `locked` flag (how the drawing
+was left, like the mirror settings; a file saved before it existed has every shape free, and one
+whose active shape is locked opens on the first shape that is not). Alongside it: which shape was active (`index`), the
 active wall, the tool, smoothing, aspect lock, `allowOverlap`, grid size and snap, the file name
 and a stats snapshot of the whole plate. Shapes that overlap are one object in the STL but are
 still written one by one, so opening the file gives the shapes back and not the merged lump.
@@ -382,6 +420,11 @@ entry per layer, keyed on that layer's `rev` and its params.
   `otherBase`/`otherBlade`), are not hit-tested, and keep their wall bands so you can see how close
   they are. **+** adds a shape with the wall settings of the one you were on. The list folds away
   behind its header on a phone and follows the window width until you fold it by hand.
+  A row is marked two ways: `aria-selected` says the shape is **held** (one of the ones Center,
+  Align and Flip act on) and `.active` says it is the one being **edited** — only one shape can be
+  that, because the settings panel can only show one. ⌘/Ctrl-click a row to hold it as well or let
+  go of it again; the padlock beside the name locks the shape out of reach (`toggleLock()`), and a
+  locked row loses its trash button and wears its padlock all the time.
   The settings panel says whose settings it is showing (`#settingsScope`, hidden while there is
   only one shape); Size, Cutter walls and Inner wall are per shape, Export is for the whole plate.
   A row whose shape is not on the standard settings carries a small `.shape-flag` after its name —
@@ -410,6 +453,24 @@ entry per layer, keyed on that layer's `rev` and its params.
   hand. One mark, one press, no dialog — the value is on screen. *Reset all* goes through
   `confirmReset()` (`#resetDialog`), which lists every setting it would change from → to, because
   wall settings have no undo and some of the sections may be folded away.
+- **Select all** (`#selectAllBtn`, in `#shapesFoot` above the overlap row, ⌘A / Ctrl+A) holds every
+  shape that is not locked, so Center, Align and Flip act on the lot; pressing it again puts them
+  down. `syncSelectRow()` flips its label to *Put the shapes down* once everything is held and
+  writes the count (`#selCount`, "3 held") beside it. It appears and folds away with the list, like
+  the overlap row — **and only under the Move tool**, which is the only one that can hold more than
+  one shape; it is also away while there are fewer than two shapes that could be held. ⌘A is the
+  same rule: it swallows the keystroke either way (the browser would select the page behind the
+  canvas) and acts only where the row is there to press.
+- **Lock the shapes you are holding** (`#lockSelBtn`, between Select all and the overlap row) is
+  one press for the lot. It reads *Lock these n shapes* under the Move tool while more than one is
+  held — the only state in which "the ones you are holding" means anything — and, since a locked
+  shape cannot be held and so cannot be pointed at that way, its counterpart is *Unlock all n
+  shapes*, offered under **any** tool whenever the plate has a locked shape and no group is held.
+  Unlocking is about the lock, not about the selection. It is hidden when neither is true;
+  `syncSelectRow()` decides which of the two it is, its label and its icon.
+  Both rows are `display: flex`, which beats the browser's own `[hidden]` rule — hence
+  `.shapes-overlap[hidden] { display: none }` in `styles.css`. Anything else added there needs it
+  too, or `hidden` will set an attribute nobody can see the effect of.
 - **Allow overlap** (`#overlapBtn`, in `#shapesFoot`) is a pressed-state row at the foot of the
   shapes panel, under the list and behind a hairline — it is how the shapes on this plate are
   allowed to sit, so it belongs with them and not in the settings panel. `syncOverlapRow()` shows
@@ -429,8 +490,8 @@ entry per layer, keyed on that layer's `rev` and its params.
   gestures share the button. `view.manual` (not a pan/zoom comparison) is what suppresses `_autoFit`.
   Zoom without an anchor re-centres on the shape's bbox; only the wheel and pinch anchor on a point.
 - Tools: **Draw** (freehand), **Points** (tap to place the next corner, on the canvas or on the
-  outline itself, or hold and pull to place a curved one; click the first corner again to close
-  the shape; once closed, a tap on the canvas or inside the shape only deselects; drag, double-tap
+  outline itself, or hold and pull to place a curved one; Alt and pull redraws the curve of a
+  corner that is already there; click the first corner again to close the shape; once closed, a tap on the canvas or inside the shape only deselects; drag, double-tap
   or Delete key or bar/menu to delete, right-click / long-press for menu, Bézier handles with
   *Sync handles*), **Move & resize** (drag, corner/edge handles, rotate knob with 15° snap,
   two-finger pinch/twist). Keyboard 1/2/3 switch tools, O/I switch wall, Ctrl+Z/Y undo/redo, Esc.
@@ -453,6 +514,24 @@ entry per layer, keyed on that layer's `rev` and its params.
   whose position it is (`Shape 2`, or `Inner wall`); it is refreshed from `onShapeChange`, so
   the numbers run along with a drag. On a phone the shape's name goes on a line of its own, or
   the bar would sit on top of the folded shapes list.
+- **Holding several shapes at once** is the Move tool's other job — and only that tool's: leaving
+  Move lets go of all but the shape being edited, the two rows that would make a selection are not
+  in the shapes list under Draw or Points, and ⌘-click on a row there is simply the plain press
+  (`editor.canHoldMany` is the one rule; `selectShape()` coerces a 'toggle' to an 'only' without
+  it, so no route can leave a drawing tool holding two).
+  **⌘/Ctrl-click** a shape on the
+  canvas (or a row in the shapes list) takes it into what is held, or back out of it; **Shift and
+  drag on empty canvas** draws a rectangle and everything it runs into is what is held when it is
+  let go (⌘ as well adds to the selection instead of replacing it) — `selectInRect()` asks Clipper,
+  with a bounding box first, so a shape counts when the rectangle really meets its outline.
+  A rectangle that catches nothing puts the shapes down. With more than one shape held there is one
+  dashed box round the lot and no handles on it: the group may be moved (by dragging, by the arrow
+  keys or through the position bar, which then reads `3 shapes`) but not resized or rotated, because
+  each of those cutters has a size of its own. The two-finger gesture is off for the same reason.
+  The held shapes that are not the one being edited are drawn in the accent (`selLine` …) instead of
+  grey, and a locked shape has a colour of its own — a cooler, bluer grey (`lockLine` …) with a
+  dashed outline and a small padlock at its corner, so which shapes are out of reach reads off the
+  canvas at a glance rather than off the list.
 - **Picking a shape up and putting it down** is the Move tool's other half of the shapes list.
   `editor.picked` says whether the tool is holding the shape being edited. A click on empty
   canvas puts it down (`dropShape()`): the box, its handles and the position bar go, the arrow
@@ -483,8 +562,15 @@ entry per layer, keyed on that layer's `rev` and its params.
   travels leaves a plain sharp corner, and the whole gesture is one undo step (the `_record()` at
   placement). Both ways of placing a corner take it — on the canvas and on the outline itself —
   because it is the same act: a corner has just appeared and this is the moment its curve is
-  drawn. Dragging a corner that was already there still moves it; the pen drag belongs to the
-  instant of placing, not to the point.
+  drawn. A plain drag on a corner that was already there still moves it — the pen drag belongs to
+  the instant of placing — but **Alt (Option)** asks for it again on any corner: `_down()` looks
+  up the vertex itself (`_hitVertex`, ahead of `hit`, because over a short handle the tip is what
+  the pointer is nearest and the gesture is about the corner) and starts the same `pen` drag on
+  it, marked `rec` because this one takes an undo step of its own. The handles are written
+  outright, not adjusted, so the corner gets a fresh curve whatever it had before; a press that
+  never reaches `PEN_PULL` pops that step again in `_up()` and builds nothing. The cursor turns
+  to a crosshair over a corner while Alt is held, so the gesture says what it is before the
+  button goes down.
 - In the Points tool, Shift while dragging constrains: a vertex to the horizontal or vertical
   line through where its drag started (`drag.p0`), a Bézier handle to a multiple of 45°
   (`snapAngle45`). The grid magnet applies to both (a handle snaps its *tip*, not its offset).
@@ -508,15 +594,32 @@ entry per layer, keyed on that layer's `rev` and its params.
 - Cursors are state-dependent (`_hover()` in the editor): default/move/resize per handle/rotate
   cursor in Move mode; pointer over points, move while dragging, copy over lines, crosshair to add.
 - **Which wall an action applies to** is decided by `editor.active`, and `app.js › syncWallActions()`
-  keeps the buttons and their tooltips in step: Clear (`editor.clear`) and Flip (`editor.flip`)
-  act on both contours of the active shape in outer mode and on its inner contour alone in inner
-  mode (both go through `_affected()`); Center moves the *whole drawing*, every shape together, so
-  they keep their places relative to each other and cannot collide; it is disabled in inner mode,
-  where the Align control (`editor.alignInner(h, v)`, nine bbox spots) takes over. Switching a mirror on or off asks for
+  keeps the buttons and their tooltips in step: Clear (`editor.clear`) acts on both contours of the
+  active shape in outer mode and on its inner contour alone in inner mode (`_affected()`).
+  **Center and Flip act on the shapes that are held**: one shape on its own is `editor.flip` and a
+  Center of that shape alone, and several are `flipSelection` / `centerSelection`, which mirror and
+  move the arrangement as one. Selecting the whole plate (*Select all*, ⌘A) is what centres
+  everything together, which is what Center used to do on its own. Center is disabled in inner
+  mode, where the Align control (`editor.alignInner(h, v)`, nine bbox spots) takes over — that one
+  is the inner wall's and is hidden while several shapes are held.
+- **Lining the held shapes up** is `#alignHBtn` / `#alignVBtn`, beside Center and only there while
+  more than one shape is held: 'h' puts their middles on one horizontal line (a row, each shape
+  keeping its x), 'v' on one vertical line. The line is the middle of what the selection covers, so
+  the shapes move towards each other instead of jumping to the canvas centre, and an alignment that
+  would walk two of them into each other is refused whole.
+- **Laying the plate out again** is `#arrangeBtn` (`editor.arrangeShapes()`), which appears with the
+  second shape and does not care what is selected: every shape that is not locked is packed into
+  rows in the middle of the canvas — tallest first, each one clear of its neighbours by its own
+  base plus `SHAPE_GAP` — and *Allow overlap* goes off with it, because that is what makes "clear
+  of each other" true. That part is not undoable, so a plate that is using the setting is asked
+  first. Nothing is rotated, and locked shapes are what the block is put beside.
+  Switching a mirror on or off asks for
   confirmation once something is drawn, because it reshapes the drawing. Center, Align, both
-  Flips and Clear are hidden/disabled until the wall being edited actually has a contour, so an
+  Flips and Clear are hidden/disabled until the wall being edited actually has a contour (or
+  several shapes are held, which is a subject of its own), so an
   empty canvas offers nothing that would do nothing; all of them are disabled while the rounding
-  tool is open, because what the canvas is showing then is a preview and not yet the drawing.
+  tool is open, because what the canvas is showing then is a preview and not yet the drawing, and
+  all of them refuse a locked shape.
 - Snapping: grid (size selector 1–20 mm, Snap toggle, at the canvas' bottom left next to the
   scale bar), guides (vertical/horizontal, draggable tabs
   at the canvas edge, double-tap tab to remove), mirror lines. Magnet distance `SNAP_PX = 10`.
@@ -642,7 +745,10 @@ entry per layer, keyed on that layer's `rev` and its params.
   change them only with a test that shows why.
 - IDs in `index.html` are the contract with `app.js`; renaming one means updating both.
 - Design: neutral bench background, white canvas with mm grid, one accent blue, dough-yellow cut
-  piece, purple Bézier handles, orange guides. On the canvas the three things you can grab have
+  piece, purple Bézier handles, orange guides. On the canvas a shape is in one of four states and
+  each has its colour: the accent for the one being edited, the accent a shade back for the others
+  being held with it, grey for the ones that are merely not being edited, and a cooler blue-grey
+  (dashed, with a padlock) for the ones that are locked. On the canvas the three things you can grab have
   three shapes: a corner is a square, a corner with curves on it a circle, and the tip of a Bézier
   handle a small diamond (`HANDLE_TIP`) — smaller than both, because it is the thing you nudge and
   not a point the outline runs through. The drawn size is not the hit radius: `HIT_R` stays 20 px
@@ -716,7 +822,25 @@ entry per layer, keyed on that layer's `rev` and its params.
 | A new shape starts with the wall settings of the one you were on | height and blade are usually meant for the whole plate; copying them once saves typing them again, and each shape still owns its own from then on |
 | Undo covers adding and deleting shapes, but never wall settings | the settings have no undo of their own, so restoring them behind a shape edit would take back a number the user had just typed. A layer coming back from the dead is the exception: its settings would otherwise be gone for good |
 | Symmetry mirrors a shape about its own centre, not about the canvas origin | with several shapes on a plate, only one of them could ever sit on the origin. The mirror lines travel with the shape, which is also why a symmetric shape can now be moved — it used to be pinned to the axis |
-| Center moves every shape together | centring one shape of several would move it into its neighbours. Moving the arrangement keeps the shapes where they are relative to each other and can never collide |
+| ~~Center moves every shape together~~ → Center moves the shapes you are holding | superseded once shapes could be selected. One shape of several is a thing you now say you mean, and the guard is what keeps it out of its neighbours — the reason the old rule existed. Holding the whole plate (*Select all*, ⌘A) is the old behaviour, one keystroke away, and with one shape on the canvas the two rules are the same thing |
+| Several shapes are held as a set, and `index` stays the anchor inside it | every panel in the app reads one shape: the settings, the size boxes, the mirror switches, the wall tabs. A selection with no anchor would leave all of them pointing at nothing, and a settings panel that showed "3 shapes" would have to invent a value for every field where they differ. So the set says what Center, Align and Flip act on, and the anchor stays the shape you are editing |
+| Several shapes held may be moved, but not resized or rotated | each of those cutters has a size of its own, in millimetres, in a box of its own. One handle dragged across six of them would change six numbers nobody typed — and the size boxes would have to show something. Moving is the one transform that means the same thing for all of them, and Align, Center, Flip and Arrange are the rest of the answer |
+| The rectangle selects what it *touches*, not what it contains | a 60 mm shape on a phone canvas is most of the canvas; a rectangle that had to swallow it whole would be a rectangle you cannot draw. Touching is also what "drag a box round these" means to the hand |
+| A rectangle that catches nothing puts the shapes down | it is the same answer as a click on empty canvas, drawn larger. Keeping the old selection after a deliberate sweep over empty space would read as the gesture having failed |
+| Align lines the shapes up on the middle of what they cover, not on the canvas centre | you line up four charms to tidy them, not to move them across the plate. The arrangement stays where it is and only the one coordinate changes |
+| An alignment that would walk two shapes into each other is refused whole, not partly | half an alignment is not a thing anybody asked for, and the shapes it did move would have to be undone one at a time. `clashingLayers()` before and after is the same measure the plate already uses, so the rule is the guard's, not a new one |
+| Arrange takes every shape on the plate, whatever is selected, and turns *Allow overlap* off | it is a tidy-up of the plate, not an edit to a few shapes — "lay this out so it prints" has no meaning for three of five cutters. And it can only promise shapes clear of each other while overlapping is not allowed, so it says so by switching the setting off rather than by leaving a promise it cannot keep |
+| Arrange packs into shelves and rotates nothing | the tightest packing there is would turn every shape a few degrees and leave a plate nobody can read. Rows of shapes, tallest first, is a layout you can look at and see why each shape is where it is — and a shape's angle is the user's, not the packer's |
+| A locked shape is out of reach, not merely un-selectable | half a lock is worse than none: a shape that cannot be selected but can still be drawn on, resized from the size boxes or centred with everything else would be a lock that lies. So every mutator asks `_editable()` first, the canvas looks straight through it, and Select all, the rectangle and Arrange all pass it by |
+| Locking the shape being edited steps the anchor to another | the settings panel shows exactly one shape and every number in it is editable. Leaving it on a shape where typing a height does nothing is the one state the panel cannot explain. With every shape locked it stays put and the refusals speak for themselves |
+| A locked shape gets a colour of its own, not just a dashed line | on a plate of six the list is not where you are looking — the canvas is. A dash alone reads as "unfinished" or "selected" as readily as "locked", and the padlock at the corner is a 7 px glyph. A cool blue-grey a step off the neutral says it before you have read anything, and still recedes: locked shapes are background, not something to reach for |
+| Locking a shape lets go of it, even when it stays the shape the panel is showing | with every shape on the plate locked there is nowhere for the anchor to step, and the Points tool was left showing the corners of a shape that would not answer a drag. A lock that leaves the handles on screen is an invitation it cannot honour — so the corners, the handles, the box and the draft line all go, the shape is drawn as locked, and the hint says why |
+| Holding several shapes is the Move tool's alone, and leaving it falls back to one | the other two tools draw on one shape: a stroke, a corner, a curve all land on exactly one outline, so a second held shape there would be a selection that does nothing — the worst kind. Move is where several shapes mean something, because moving, lining up and flipping are things you do to an arrangement |
+| …so the controls that would make a selection are not on screen under Draw or Points | a control that is there but refuses, or that quietly changes your tool to make itself work, is worse than one that is not there: the first makes you guess the rule and the second takes the tool out of your hand mid-drawing. Away under those tools, the panel shows exactly what can be done from where you are |
+| …but *Unlock all* stays, whatever tool is in hand | it is about the lock, not about the selection — there is nothing to hold and nothing to move. A shape locked from the Move tool an hour ago has to be openable from wherever you happen to be, or the lock becomes a trap you have to switch tools to escape |
+| Locking acts on the shapes you are holding; unlocking acts on all the locked ones | a locked shape cannot be held, so on the way back "the selected ones" has nothing to point at — the only honest counterpart is every shape that is locked. In practice it is the same gesture twice: lock three shapes and the row turns into *Unlock all 3 shapes*, so the second press takes back exactly what the first one did |
+| Locking is not an undo step, and undo does not take a lock back off | it is not an edit to the drawing — like the wall settings, it is how you are working at the moment. A ⌘Z that quietly unlocked a shape would take the guard off the very thing it was put on |
+| The selection is part of an undo step, though | undoing an align or a group move and finding the shapes let go of would mean selecting all of them again to try once more. Layer ids survive the copy, so the shapes that come back are the same shapes |
 | The Points tool does not close a shape for you; you close it by clicking the first point | three corners are not a cutter, they are three corners. Closing on the third one meant every outline began life as a triangle in the 3D preview, and the only way to draw a square was to draw a triangle first and then correct it. The first point pulses and the canvas says what to do, because a rule nobody can see is worse than the wrong rule |
 | While an outline is open there is no shape at all: no fill, no bands, no size, no solid | it is a line of corners, and showing it as a cutter is the thing that was wrong. It also gives the rule its own edge — the 3D preview filling in *is* the shape being made |
 | A closed outline takes new corners only on its own lines; a click beside or inside it deselects | once the shape exists, a click on the canvas almost never means "grow the outline by one corner out there" — it means "I am done with this point". Corners go where you can see they will go, on the line, where the cursor already turns into a + |
@@ -733,6 +857,7 @@ entry per layer, keyed on that layer's `rev` and its params.
 | A curved corner bulges past itself, so rounding makes the shape slightly bigger | the curve has to pass through the anchor, so with one anchor per corner it can only bow outwards. Filleting instead (two anchors per corner, straight edges kept) would double the anchors every time and stop the slider being a dial you can turn back. The canvas shows the size changing as you slide, the size boxes are right there, and Cancel is one press away |
 | Placing a corner and pulling draws its curve; it does not move the corner | you put the corner where you meant it a fraction of a second ago — dragging it straight off that spot is the one thing you cannot have wanted. The pull is the only moment a new corner's curve can be drawn in the same gesture, and it is how every pen tool people have used works. Place, pull, place, pull draws a smooth outline in one pass instead of placing corners and then curving each of them |
 | …and on the outline itself as much as on the canvas | a corner put on a line is a corner being placed, and it is usually put there precisely because the outline needs to bend at that spot. Two ways of adding a corner that answer the same press differently is the kind of rule nobody can hold in their head |
+| Alt and pull redraws an existing corner's curve, and replaces its handles rather than adjusting them | drawing a curve is a thing you do again: the shape is judged once it is closed, and the corner you want to bend is then one you placed a minute ago. The gesture was already in everyone's fingers from placing corners, so it is the same one, behind a modifier — because the unmodified drag on an old corner has to keep moving it. Replacing both handles is what "draw this curve" means; keeping half of what was there would make the result depend on a curve the user is in the middle of discarding, and adjusting one handle is what dragging its own tip is for |
 | The two handles of a pulled corner are exactly opposite and the same length | that is what makes the outline run smoothly through it, and it is the only thing a single drag can mean. Adjusting one afterwards keeps the other's length instead (`_mirrorHandle`), which is a different question with a different answer |
 | The pull threshold is measured on the screen, not on the canvas | the toolbar gains buttons the moment the first corner goes down. If that ever grows a row, the canvas slides out from under a perfectly still pointer, and a canvas-relative threshold reads the slide as a 38 px drag. The screen does not move |
 | A file dropped on the window is imported; the canvas is lit up as where it lands | dragging a file in is how people bring a file to an app, and the two pickers were the only way. The canvas is the honest target — that is where the shapes appear — and showing it beats a veil that says nothing about where the file is going |
@@ -788,6 +913,11 @@ entry per layer, keyed on that layer's `rev` and its params.
 - Regeneration ~150–300 ms; it is debounced (120 ms) and not off-thread. A Web Worker would help on
   slow phones if it ever becomes a complaint.
 - Only the first file of a multi-file drop is imported; the rest are named in a toast and ignored.
+- Holding several shapes needs a keyboard: ⌘/Ctrl-click or Shift and a rectangle. On a touch screen
+  the ways in are *Select all* and the padlocks — lock what you do not want, hold the rest. A
+  touch gesture for it has not been asked for; if one is added, the rows are where it belongs.
+- A group of shapes can be moved but not resized or rotated, and there is no "distribute evenly".
+  Arrange is the only layout help beyond Align.
 - The loader is a veil, not a progress bar: the work is on the main thread and cannot report how
   far along it is. A Web Worker would fix both that and the freeze (see above).
 - UI tests are not automated in-repo (they were run with Playwright during development); see §8.
@@ -806,8 +936,8 @@ entry per layer, keyed on that layer's `rev` and its params.
    one watertight soup and that a shape that will not build is named.
 2. **Project round-trip** — `node tests/project-roundtrip.mjs`. All cases must PASS; add one
    whenever you add something to the saved state. A plate of several shapes with different
-   settings, a plate of two overlapping shapes (saved apart, built as one object) and a schema-1
-   file opening as a plate of one are all fixed cases.
+   settings, a plate of two overlapping shapes (saved apart, built as one object), a schema-1
+   file opening as a plate of one and a locked shape coming back locked are all fixed cases.
 2b. **STL round-trip** — `node tests/stl-import.mjs 40`. Every fixed case must PASS (same outline
    point for point, same settings, same solid) and the random cases must come back within 1 % of
    the volume. A plate of two cutters must come back as two shapes with their own settings, in
@@ -856,6 +986,48 @@ entry per layer, keyed on that layer's `rev` and its params.
    grid stay yours. Drop a file while a dialog is up — nothing may happen, and in particular the
    browser must not open it. Check the message over the window appears while a big file is read
    and stays up until the 3D preview has caught up.
+   Then holding several shapes: with three shapes on the plate and the Move tool in hand,
+   click one and ⌘-click (Ctrl-click on Windows) another — both must go accent-coloured, one
+   dashed box must appear round the two, the shapes list must mark both rows with only the one
+   you clicked first carrying the active bar, the foot of the list must read `2 held`, and the
+   position bar must say `2 shapes`. Drag from inside either one: both must move and the third
+   must stay. Press Shift and drag a rectangle on empty canvas: it must draw as you drag and
+   hold everything it touches when you let go (⌘ as well adds to what is held); a rectangle over
+   empty canvas must put them all down. Then *Select all* (or ⌘A): every shape held, the button
+   reads *Put the shapes down*, pressing it again lets go. With the lot held, press Center — they
+   must move together and keep their places relative to each other; Align on a horizontal line
+   must put their middles on one row, each keeping its x; Flip left–right must mirror each shape
+   *and* swap their places. Select one shape only and press Center: that shape alone must move to
+   the middle. Undo must take each of those back in one press and leave the shapes still held.
+   Then locking: press the padlock in a row — the shape must go dashed and grey on the canvas with
+   a small padlock at its corner and its own cool blue-grey colour (clearly not the grey of a shape
+   that is merely not being edited), its row must dim and lose its trash button, clicking it on the
+   canvas or in the list must do nothing but say why, Select all and the rectangle must pass it by,
+   and drawing, Clear, the size boxes and the rounding tool must all refuse it. Unlock it and
+   everything must work again. Lock the shape you are working on: the settings panel must step to
+   another shape. With three shapes held, the row under *Select all* must read *Lock these 3
+   shapes*: one press must lock all three, and the row must then read *Unlock all 3 shapes* and put
+   them all back with one more press. Check the tool rule too: with several shapes held, switch to
+   Draw or Points — the group must fall back to the one shape being edited, the Align buttons and
+   the held count must go, and the rows must follow at once; switching back to Move must not bring
+   the group back — and under Draw and Points the *Select all* and *Lock these n shapes* rows must
+   not be in the shapes list at all (check they are really gone, not merely `hidden`: a `display:
+   flex` row needs its own rule), while *Allow overlap* stays. ⌘-click on a row there must be the
+   plain press, and ⌘A must do nothing — and must not let the browser select the page either. Lock
+   a shape from the Move tool and switch to Points: *Unlock all* must still be there, because a
+   lock has to be openable from wherever you are.
+   With the Points tool in hand and a corner of a shape selected, lock that shape:
+   the corner, its handles and the point bar must all go. Lock every shape on the plate — the panel
+   then has nowhere to step, so it keeps showing the last one: the canvas must draw it locked like
+   the rest, with no corners, no handles and no box on it, and the hint must say the shape is
+   locked. Save, reload, open — the locked shape must come back locked.
+   Then *Arrange*: with the shapes scattered (and one of them locked), press it — every shape that
+   is not locked must land in tidy rows in the middle of the canvas, none of them touching, the
+   locked one must not have moved, and *Allow overlap* must be off afterwards (with it on, the
+   press must ask first). Undo must put the shapes back where they were.
+   Then resetting several shapes at once: give two of three shapes different wall settings, hold
+   both, and press *Reset them* at the top of the settings panel — the dialog must list the
+   settings under a heading per shape, and confirming must put all of them back.
    Then picking shapes up: with two shapes on the plate and the Move tool in hand, move the
    pointer over the grey one — it must light up and the cursor become a pointer — and click it:
    it becomes the shape being edited, the settings panel and the shapes list follow, and the box

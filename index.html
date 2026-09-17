@@ -93,6 +93,12 @@
         <span class="spacer"></span>
         <div class="toolbar-group">
           <button class="btn ghost small icon" id="centerBtn" title="Center — move the whole shape to the middle of the canvas. The shape and its size stay the same."><i class="ph ph-crosshair-simple"></i></button>
+          <!-- Only with more than one shape held: they line up on one line, each keeping the
+               other coordinate. The plate-wide tidy-up beside them takes every shape that is not
+               locked and puts it in rows in the middle of the canvas. -->
+          <button class="btn ghost small icon" id="alignHBtn" hidden title="Align on a horizontal line — the selected shapes line up in a row, each keeping where it sits left to right."><i class="ph ph-align-center-horizontal"></i></button>
+          <button class="btn ghost small icon" id="alignVBtn" hidden title="Align on a vertical line — the selected shapes line up in a column, each keeping where it sits top to bottom."><i class="ph ph-align-center-vertical"></i></button>
+          <button class="btn ghost small icon" id="arrangeBtn" hidden title="Arrange — lay every shape out again in rows in the middle of the canvas, clear of each other. Locked shapes stay where they are."><i class="ph ph-grid-four"></i></button>
           <div class="align-wrap" id="alignWrap" hidden>
             <button class="btn ghost small icon" id="alignBtn" aria-expanded="false" aria-controls="alignMenu" title="Align — put the inner wall against a side or the middle of the outer shape. Only its position changes."><i class="ph ph-align-center-horizontal-simple"></i></button>
             <div class="align-menu" id="alignMenu" hidden role="dialog" aria-label="Align the inner wall">
@@ -146,6 +152,17 @@
             <!-- How the shapes on this plate are allowed to sit: only a plate with something to
                  run into has anything to allow, so it appears with the second shape. -->
             <div class="shapes-foot" id="shapesFoot" hidden>
+              <!-- Several shapes at once: ⌘/Ctrl-click a row or a shape on the canvas, or hold
+                   Shift and drag a rectangle round them. Locked shapes are passed by. -->
+              <button type="button" class="shapes-overlap" id="selectAllBtn"
+                      title="Select all — hold every shape on the plate at once, so Center, Align and Flip act on the lot. Locked shapes are left out.">
+                <i class="ph ph-selection-all"></i><span id="selectAllLabel">Select all</span><em class="sel-count" id="selCount"></em>
+              </button>
+              <!-- Lock every shape you are holding in one press; with none held it is the way
+                   back — everything on the plate that is locked, unlocked at once. -->
+              <button type="button" class="shapes-overlap" id="lockSelBtn" hidden>
+                <i class="ph ph-lock-simple" id="lockSelIcon"></i><span id="lockSelLabel">Lock these shapes</span>
+              </button>
               <button type="button" class="shapes-overlap" id="overlapBtn" aria-pressed="false"
                       title="Allow overlap — shapes may run into each other instead of stopping against their neighbours. Where they do they come out as one merged object; the project file still keeps them as separate shapes.">
                 <i class="ph ph-unite"></i><span>Allow overlap</span>
@@ -323,7 +340,7 @@
       <div class="settings-reset" id="resetAllRow" hidden>
         <i class="ph ph-arrow-counter-clockwise"></i>
         <span id="resetAllNote">1 setting differs from the default</span>
-        <button class="btn small" type="button" id="resetAllBtn" title="Reset all — put every setting of this shape back to the app's default. It shows you what would change first.">Reset all</button>
+        <button class="btn small" type="button" id="resetAllBtn" title="Reset all — put every setting of this shape back to the app's default. It shows you what would change first."><span id="resetAllLabel">Reset all</span></button>
       </div>
 
       <div class="sec">

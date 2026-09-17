@@ -96,13 +96,16 @@ export function newLayer(params = null) {
     // there the mirror lines close the half, so there is nothing for the user to close.
     open: { outer: false, inner: false },
     bridgeAuto: true,
+    // A locked shape is out of reach: it cannot be selected, drawn on, moved or arranged, and
+    // Select all passes it by. It stays on the canvas and is still built into the STL.
+    locked: false,
     rev: 0,
   };
 }
 
 const copyLayer = (l) => ({
   id: l.id, shape: copyShape(l.shape), sym: { ...l.sym }, symOrigin: { ...l.symOrigin },
-  params: { ...l.params }, open: { ...l.open }, bridgeAuto: l.bridgeAuto, rev: l.rev,
+  params: { ...l.params }, open: { ...l.open }, bridgeAuto: l.bridgeAuto, locked: !!l.locked, rev: l.rev,
 });
 
 // Turn a control polygon (with optional Bézier handles) into a plain polyline.
@@ -215,6 +218,15 @@ export class ShapeEditor {
       // you can see what a click would pick up without it already looking picked up
       hotLine: 'rgba(145,132,217,0.7)', hotFill: 'rgba(145,132,217,0.08)',
       hotBase: 'rgba(147,151,171,0.14)', hotBlade: 'rgba(145,132,217,0.4)',
+      // the ones in the selection beside the one being edited: they move with it, so they are
+      // drawn in the accent rather than in grey — a shade back from the shape you are drawing on
+      selLine: 'rgba(145,132,217,0.8)', selFill: 'rgba(145,132,217,0.09)',
+      selBase: 'rgba(145,132,217,0.1)', selBlade: 'rgba(145,132,217,0.35)',
+      // a locked shape: a cooler, bluer grey than the shapes that are merely not being edited,
+      // so a glance at the canvas says which ones cannot be grabbed — the dashed outline and the
+      // little padlock confirm it. It still recedes: this is background, not something to reach for.
+      lockLine: 'rgba(116,154,190,0.8)', lockFill: 'rgba(116,154,190,0.07)',
+      lockBase: 'rgba(116,154,190,0.09)', lockBlade: 'rgba(116,154,190,0.3)',
 
     }, colors);
 
@@ -222,12 +234,14 @@ export class ShapeEditor {
     // are accessors onto that layer, so everything below reads as if there were only ever one.
     this.layers = [newLayer()];
     this.index = 0;
-    // Whether the Move tool is holding the shape being edited: the box, its handles and the
-    // position bar are on it and the arrow keys nudge it. A click on empty canvas puts it down;
-    // a click on a shape picks that one up. Anything that changes which shape is being edited
-    // hands the new one over held, so the tool is never left grasping at nothing.
-    this.picked = true;
+    // Which shapes the Move tool is holding, by layer id. Usually the one you clicked; ⌘/Ctrl-click
+    // and a Shift-drag round several of them make it a set, and then Center, Align, Flip and the
+    // arrow keys act on the lot. `index` stays the anchor — the shape the settings panel shows and
+    // the other tools draw on — and is in the set whenever anything is held at all. Empty means
+    // the shape has been put down: no box, no handles, no position bar.
+    this.sel = new Set([this.layers[0].id]);
     this.hot = -1;   // the shape under the pointer, lit up as what a click would pick up
+    this.marquee = null;   // the rectangle being dragged round the shapes (Shift on empty canvas)
     this.active = 'outer';
     this.tool = 'draw';
     this.smoothing = 0.4;
@@ -285,6 +299,103 @@ export class ShapeEditor {
   get open() { return this.layer.open; }
   get layerCount() { return this.layers.length; }
 
+  // ----- which shapes are selected -----
+  // `picked` is what it always was — is the shape being edited in hand? — asked of the set.
+  get picked() { return this.sel.has(this.layer.id); }
+  // The selected shapes as indexes, in plate order.
+  get selection() { return this.layers.map((l, i) => i).filter(i => this.sel.has(this.layers[i].id)); }
+  get selectionCount() { return this.selection.length; }
+  // More than one shape in hand: the Move tool then offers moving and nothing else, and Center,
+  // Align and Flip act on the group rather than on one shape.
+  get multi() { return this.selectionCount > 1; }
+  isSelected(i) { return this.sel.has(this.layers[i]?.id); }
+  isLocked(i) { return !!this.layers[i]?.locked; }
+  get locked() { return !!this.layer.locked; }
+  // How many shapes could still be selected — what Select all is worth pressing for.
+  get unlockedCount() { return this.layers.filter(l => !l.locked).length; }
+  _selLayers() { return this.layers.filter(l => this.sel.has(l.id)); }
+  // Hold the shape being edited and nothing else. Everything that changes which shape that is
+  // hands the new one over held, so the tool is never left grasping at nothing — and a locked
+  // shape is never held, because nothing may be done to it.
+  _hold() { this.sel = new Set(this.layer.locked ? [] : [this.layer.id]); }
+
+  // Holding more than one shape is the Move tool's: it is the tool that moves, lines up and flips
+  // them as a group, and the other two draw on one shape, where a second one has nothing to mean.
+  get canHoldMany() { return this.tool === 'move'; }
+
+  // Take a shape into the selection, out of it, or on its own. 'only' is a plain click, 'toggle'
+  // is ⌘/Ctrl-click, 'add' is what a Shift-drag adds. A locked shape is passed by.
+  selectShape(i, mode = 'only') {
+    const l = this.layers[i];
+    if (!l || l.locked) return false;
+    if (mode !== 'only' && !this.canHoldMany) mode = 'only';
+    if (mode === 'toggle' && this.sel.has(l.id)) {
+      // The last shape in the set stays: letting go of everything is what the empty canvas is for.
+      if (this.selectionCount <= 1) return false;
+      this.sel.delete(l.id);
+      if (i === this.index) this.setLayer(this.selection[0], { keep: true });   // reports it itself
+      else this._changed({ selectionOnly: true });
+      return true;
+    }
+    if (mode === 'only') this.sel = new Set([l.id]);
+    else this.sel.add(l.id);
+    if (i !== this.index) this.setLayer(i, { keep: true });
+    else this._changed({ selectionOnly: true });
+    return true;
+  }
+
+  // Every shape that is not locked. The anchor moves to one of them if it was not one already.
+  selectAll() {
+    const free = this.layers.filter(l => !l.locked);
+    if (!free.length || !this.canHoldMany) return 0;
+    this.sel = new Set(free.map(l => l.id));
+    if (this.layer.locked) {
+      this.index = this.layers.indexOf(free[0]);
+      this.active = 'outer';
+      this._select(-1);
+    }
+    this._changed({ selectionOnly: true });
+    return free.length;
+  }
+
+  // Lock shapes out of reach, or let them back in. Locking the one being edited lets go of it —
+  // out of the selection, and the corner that was selected on it with it — and steps the anchor to
+  // a shape that can still be worked on, if there is one: the settings panel has to be showing
+  // something you are allowed to change. Several at once is one press from the shapes list, and
+  // the anchor is settled once at the end rather than hopping from shape to shape.
+  lockLayers(indexes, on = true) {
+    const list = [...new Set(indexes)].map(i => this.layers[i]).filter(l => l && !!l.locked !== !!on);
+    if (!list.length) return 0;
+    this._dropRound();
+    for (const l of list) {
+      l.locked = !!on;
+      if (l.locked) this.sel.delete(l.id);
+    }
+    if (on) { this.stroke = null; this.drag = null; this.gesture = null; this.viewGesture = null; }
+    if (this.layer.locked) {
+      const next = this.layers.findIndex(x => !x.locked);
+      if (next >= 0) { this.index = next; this._hold(); this.active = 'outer'; }
+      this._select(-1);
+    } else if (!this.sel.size) this._hold();
+    this._keepOutCache = { key: null, polys: [] };
+    this.dirty = true;
+    this._changed({ selectionOnly: true });
+    return list.length;
+  }
+
+  lockLayer(i, on = true) { return this.lockLayers([i], on) > 0; }
+
+  // Which shapes are locked, as indexes — what "unlock them all" has to act on.
+  get lockedLayers() { return this.layers.map((l, i) => i).filter(i => this.layers[i].locked); }
+
+  // Is the shape being edited one that may be changed at all? Every edit goes through here, so a
+  // locked shape stays exactly as it is whichever tool or button is reached for.
+  _editable(note = true) {
+    if (!this.layer.locked) return true;
+    if (note) this._blockNote('That shape is locked — unlock it in the shapes list to change it.', false);
+    return false;
+  }
+
   // What the canvas has to say about an outline still being placed — null while there is none.
   // `closable` is the moment the first point turns into the button that finishes the shape.
   get draft() {
@@ -297,7 +408,7 @@ export class ShapeEditor {
   // Finish the outline being placed: from here on it is a shape — filled, measured, built into
   // the 3D preview, and added to only on its own lines. This is what clicking the first point does.
   closeContour(k = this.active) {
-    if (!this.open[k] || this.shape[k].length < 3) return false;
+    if (!this._editable() || !this.open[k] || this.shape[k].length < 3) return false;
     this._record();
     this.open[k] = false;
     this.layer._disp = null;
@@ -324,18 +435,21 @@ export class ShapeEditor {
       const drafting = ['outer', 'inner'].some(k => l.open[k] && l.shape[k].length);
       return {
         id: l.id, index: i, active: i === this.index,
+        selected: this.sel.has(l.id), locked: !!l.locked,
         outer: d.outer, inner: d.inner, drafting,
         empty: d.outer.length < 3 && !drafting,
       };
     });
   }
 
-  setLayer(i) {
+  // `keep` moves the anchor without collapsing the selection — what ⌘-click and a marquee do.
+  setLayer(i, { keep = false } = {}) {
     if (i < 0 || i >= this.layers.length || i === this.index) return;
+    if (this.layers[i].locked) return;
     this._dropRound();
     this.stroke = null; this.drag = null; this.gesture = null; this.viewGesture = null;
     this.index = i;
-    this.picked = true;
+    if (keep) this.sel.add(this.layers[i].id); else this._hold();
     // The inner wall of the shape you have just come to may not exist; fall back rather than
     // leaving the tabs pointing at nothing.
     if (this.active === 'inner' && this.shape.inner.length < 3) this.active = 'outer';
@@ -347,22 +461,20 @@ export class ShapeEditor {
   // Pick a shape up off the canvas: it becomes the shape being edited and the Move tool takes
   // hold of it. Clicking a shape is the other way into the shapes list's job — with your eyes
   // on the drawing, where the shape you mean is the one you can see.
-  pickShape(i) {
-    if (i < 0 || i >= this.layers.length) return false;
-    if (i === this.index && this.picked) return false;
-    this.picked = true;
+  // mode: 'only' replaces the selection (a plain click), 'toggle' adds or removes (⌘/Ctrl-click).
+  pickShape(i, mode = 'only') {
+    if (i < 0 || i >= this.layers.length || this.layers[i].locked) return false;
+    if (mode === 'only' && i === this.index && this.picked && !this.multi) return false;
     this._setHot(-1);
-    if (i !== this.index) this.setLayer(i);   // reports the change itself
-    else this._changed({ selectionOnly: true });
-    return true;
+    return this.selectShape(i, mode);
   }
 
   // Put the shape down: nothing is held, so the box, its handles and the position bar go. The
   // shape itself stays the one being edited — it is the one the settings panel is showing, and
   // the other tools still draw on it — it is only the Move tool that has let go.
   dropShape() {
-    if (this.tool !== 'move' || !this.picked) return false;   // only this tool ever holds a shape
-    this.picked = false;
+    if (this.tool !== 'move' || !this.sel.size) return false;   // only this tool ever holds a shape
+    this.sel.clear();
     this._setHot(-1);
     this._changed({ selectionOnly: true });
     return true;
@@ -376,7 +488,7 @@ export class ShapeEditor {
     const l = newLayer(this.params);
     this.layers.push(l);
     this.index = this.layers.length - 1;
-    this.picked = true;
+    this._hold();
     this.active = 'outer';
     this._select(-1);
     this._changed();
@@ -385,12 +497,13 @@ export class ShapeEditor {
 
   removeLayer(i = this.index) {
     if (this.layers.length <= 1 || i < 0 || i >= this.layers.length) return;
+    if (this.layers[i].locked) { this._blockNote('That shape is locked — unlock it before taking it off the plate.', false); return; }
     this._dropRound();
     this._record();
     this.layers.splice(i, 1);
     if (this.index > i) this.index--;
     if (this.index >= this.layers.length) this.index = this.layers.length - 1;
-    this.picked = true;
+    this._hold();
     this.active = 'outer';
     this._select(-1);
     this._autoFit();
@@ -408,7 +521,20 @@ export class ShapeEditor {
 
   // Reaching for the Move tool means moving the shape you are on, so it comes back held
   // however the canvas was left.
-  setTool(tool) { this.tool = tool; this.stroke = null; this.drag = null; this.picked = true; this._setHot(-1); this._select(-1); this._setCursor(this._defaultCursor()); this.requestRender(); }
+  // Reaching for a tool means working on the shape you are on, so it comes back held however the
+  // canvas was left — and leaving the Move tool lets go of all but that one: several shapes at
+  // once is the Move tool's, and the shapes list has to say so the moment the tool changes.
+  setTool(tool) {
+    this.tool = tool;
+    this.stroke = null; this.drag = null; this.marquee = null;
+    const before = this.sel.size;
+    if (tool !== 'move' || !this.picked) this._hold();
+    this._setHot(-1);
+    this._select(-1);
+    this._setCursor(this._defaultCursor());
+    if (this.sel.size !== before) this._changed({ selectionOnly: true });
+    else this.requestRender();
+  }
   setActive(which) { this._dropRound(); this.active = which; this.stroke = null; this.drag = null; this._select(-1); this.requestRender(); }
 
   // ----- view (zoom / pan) -----
@@ -491,6 +617,7 @@ export class ShapeEditor {
   // sketch, a starter shape, a file — is finished by definition, so both default to closed.
   setShape(shape, { record = true, center = false, fit = true, place = true,
                     open = { outer: false, inner: false } } = {}) {
+    if (!this._editable()) return;
     this._dropRound();
     if (record) this._record();
     this.shape = { outer: copy(shape.outer || []), inner: copy(shape.inner || []) };
@@ -523,10 +650,11 @@ export class ShapeEditor {
       if (sh.symOrigin) l.symOrigin = { x: sh.symOrigin.x, y: sh.symOrigin.y };
       if (sh.params) l.params = { ...DEFAULT_PARAMS, ...sh.params };
       if (sh.bridgeAuto !== undefined) l.bridgeAuto = !!sh.bridgeAuto;
+      l.locked = !!sh.locked;
       return l;
     });
     this.index = 0;
-    this.picked = true;
+    this._hold();
     this.active = 'outer';
     this._select(-1);
     this._keepOutCache = { key: null, polys: [] };
@@ -550,7 +678,7 @@ export class ShapeEditor {
     for (const it of items) this.layers.push(this._layerFrom(it, base));
     this._placeGroup(first);
     this.index = first;
-    this.picked = true;
+    this._hold();
     this.active = 'outer';
     this._select(-1);
     this._keepOutCache = { key: null, polys: [] };
@@ -572,6 +700,7 @@ export class ShapeEditor {
     const symOn = l.sym.x || l.sym.y;
     l.open = { outer: !!it.open?.outer && !symOn, inner: !!it.open?.inner && !symOn };
     if (it.bridgeAuto !== undefined) l.bridgeAuto = !!it.bridgeAuto;
+    l.locked = !!it.locked;
     return l;
   }
 
@@ -634,6 +763,7 @@ export class ShapeEditor {
         params: { ...l.params },
         open: { ...l.open },
         bridgeAuto: !!l.bridgeAuto,
+        locked: !!l.locked,
       })),
       index: this.index,
       active: this.active,
@@ -661,10 +791,17 @@ export class ShapeEditor {
       const symOn = layer.sym.x || layer.sym.y;
       layer.open = { outer: !!l.open?.outer && !symOn, inner: !!l.open?.inner && !symOn };
       layer.bridgeAuto = !!l.bridgeAuto;
+      layer.locked = !!l.locked;
       return layer;
     });
     this.index = Math.min(Math.max(0, Math.round(st.index) || 0), this.layers.length - 1);
-    this.picked = true;
+    // A file may have been saved with a locked shape as the active one. The settings panel has to
+    // be showing a shape that can be changed, so the anchor steps to the first one that can.
+    if (this.layer.locked) {
+      const free = this.layers.findIndex(l => !l.locked);
+      if (free >= 0) this.index = free;
+    }
+    this._hold();
     this.active = st.active === 'inner' && this.shape.inner.length >= 3 ? 'inner' : 'outer';
     this.tool = ['draw', 'points', 'move'].includes(st.tool) ? st.tool : 'move';
     if (typeof st.smoothing === 'number') this.smoothing = st.smoothing;
@@ -768,7 +905,7 @@ export class ShapeEditor {
 
   // Scale the whole shape about its centre to the given size (mm). Either value may be null.
   setSize(width, height, { record = true } = {}) {
-    if (this._display().outer.length < 3) return;
+    if (!this._editable() || this._display().outer.length < 3) return;
     const b = bounds(this._display().outer);
     let sx = width ? width / b.width : null;
     let sy = height ? height / b.height : null;
@@ -791,6 +928,7 @@ export class ShapeEditor {
   // Where the shape sits: the middle of the wall being edited, which is the box the Move tool
   // draws its handles on. null while that wall has no contour.
   get shapePos() {
+    if (this.multi) { const g = this.selBounds(); return g ? { x: g.cx, y: g.cy } : null; }
     const pts = this._display()[this.active];
     if (pts.length < 3) return null;
     const b = bounds(pts);
@@ -802,6 +940,8 @@ export class ShapeEditor {
   // travels with it, and a step into another shape is simply not taken.
   nudgeShape(dx, dy, { record = true } = {}) {
     if (!dx && !dy) return;
+    if (this.multi) { this._runSelection(this._groupStart(), p => ({ x: p.x + dx, y: p.y + dy }), { record }); return; }
+    if (!this._editable()) return;
     if (this._display()[this.active].length < 3) return;
     if (record) this._record();
     if (!this._applyTransform(this._startState(), p => ({ x: p.x + dx, y: p.y + dy }))) {
@@ -819,24 +959,240 @@ export class ShapeEditor {
     this.nudgeShape(x - c.x, y - c.y);
   }
 
-  // Centre the drawing on the canvas. With more than one shape the whole arrangement moves as
-  // one, so the shapes keep their places relative to each other — and cannot run into anything.
-  center() {
-    const b = this.allBounds();
-    if (!b) return;
-    this._record();
-    const f = p => ({ x: p.x - b.cx, y: p.y - b.cy });
-    for (const l of this.layers) {
-      l.shape = { outer: mapPts(l.shape.outer, f), inner: mapPts(l.shape.inner, f) };
-      l.symOrigin = f(l.symOrigin);
-      l.rev++;
+  // ----- the selected shapes as a group -----
+  // Center, Align, Flip and the arrow keys all act on the selection: one shape on its own, or
+  // several of them together. Selecting the whole plate (Select all) is what centres the
+  // arrangement the way Center used to — and then the shapes keep their places relative to each
+  // other and cannot run into anything.
+
+  // The box round every selected shape, in canvas mm. null while none of them has an outline.
+  selBounds() {
+    const all = this._selLayers().map(l => this._displayOf(l).outer).filter(o => o.length >= 3);
+    return all.length ? bounds(all.flat()) : null;
+  }
+
+  // What a group transform starts from: each selected layer's contours and mirror origin, so all
+  // of them are transformed from the same place however far a drag wanders.
+  _groupStart() {
+    return this._selLayers().map(l => ({
+      l, outer: copy(l.shape.outer), inner: copy(l.shape.inner), origin: { ...l.symOrigin },
+    }));
+  }
+
+  // Transform every selected shape. `f` is given the point and the layer it belongs to, so an
+  // action that moves each shape by its own amount (Align) goes through here too. A result that
+  // would run into a shape outside the selection is taken back whole, exactly as a single-shape
+  // transform is: the group stops against its neighbour rather than passing through it.
+  _applyGroupTransform(start, f) {
+    const before = start.map(s => ({ l: s.l, outer: s.l.shape.outer, inner: s.l.shape.inner, origin: s.l.symOrigin }));
+    for (const s of start) {
+      s.l.shape = { outer: mapPts(s.outer, p => f(p, s.l)), inner: mapPts(s.inner, p => f(p, s.l)) };
+      s.l.symOrigin = f({ ...s.origin }, s.l);
+      s.l.rev++; s.l._disp = null;
     }
+    if (this._groupAllowed(start)) return true;
+    for (const b of before) {
+      b.l.shape = { outer: b.outer, inner: b.inner }; b.l.symOrigin = b.origin;
+      b.l.rev++; b.l._disp = null;
+    }
+    this._blockNote(BLOCK_MSG);
+    return false;
+  }
+
+  // Is the selection, as it stands this instant, clear of the shapes outside it? The shapes
+  // inside it move together, so how they sit among themselves is not this question.
+  _groupAllowed(start) {
+    if (this.allowOverlap) return true;
+    const idx = new Set(start.map(s => this.layers.indexOf(s.l)));
+    if (idx.size >= this.layers.length) return true;   // nothing left outside to run into
+    const mine = Math.max(...start.map(s => this._baseWidthOf(s.l)));
+    const keep = this._keepOut(idx, mine);
+    if (!keep.length) return true;
+    try {
+      for (const s of start) {
+        const o = this._displayOf(s.l).outer;
+        if (o.length < 3) continue;
+        for (const k of keep) if (intersectPolygons([o], [k]).length) return false;
+      }
+    } catch { return true; }   // an outline Clipper cannot read is the builder's problem
+    return true;
+  }
+
+  // Do a whole-selection edit as one undo step, and take it back whole if it lands somewhere it
+  // may not. `selfCheck` is for the actions that change how the selected shapes sit among
+  // themselves — Align walks them towards one line, which can walk two of them into each other.
+  _runSelection(start, f, { record = true, selfCheck = false, message = null } = {}) {
+    if (!start.length) return false;
+    const before = selfCheck ? this.clashingLayers().length : 0;
+    if (record) this._record();
+    if (!this._applyGroupTransform(start, f)) { if (record) this.undoStack.pop(); return false; }
+    if (selfCheck && !this.allowOverlap && this.clashingLayers().length > before) {
+      for (const s of start) {
+        s.l.shape = { outer: s.outer, inner: s.inner }; s.l.symOrigin = { ...s.origin };
+        s.l.rev++; s.l._disp = null;
+      }
+      if (record) this.undoStack.pop();
+      this._blockNote(message || BLOCK_MSG);
+      this._changed();
+      return false;
+    }
+    this._autoFit();
     this._changed();
+    return true;
+  }
+
+  // Move the selected shapes so that the middle of what they cover is the middle of the canvas.
+  // They keep their places relative to each other, so a selection of several lands as it stands.
+  centerSelection() {
+    const b = this.selBounds();
+    if (!b || (!b.cx && !b.cy)) return false;
+    return this._runSelection(this._groupStart(), p => ({ x: p.x - b.cx, y: p.y - b.cy }));
+  }
+
+  // Line the selected shapes up. 'h' puts their middles on one horizontal line — a row, each
+  // shape keeping its x; 'v' puts them on one vertical line. The line is the middle of what the
+  // selection covers, so the shapes move towards each other rather than off to the canvas centre.
+  alignSelection(axis = 'h') {
+    const start = this._groupStart();
+    if (start.length < 2) return false;
+    const b = this.selBounds();
+    if (!b) return false;
+    const d = new Map();
+    for (const s of start) {
+      const o = this._displayOf(s.l).outer;
+      const lb = o.length >= 3 ? bounds(o) : null;
+      d.set(s.l.id, !lb ? 0 : axis === 'h' ? b.cy - lb.cy : b.cx - lb.cx);
+    }
+    return this._runSelection(start, (p, l) => axis === 'h'
+      ? { x: p.x, y: p.y + (d.get(l.id) || 0) }
+      : { x: p.x + (d.get(l.id) || 0), y: p.y },
+    { selfCheck: true, message: 'Lining those up would put shapes on top of each other — move them apart, or allow overlap.' });
+  }
+
+  // Flip the selection about its own middle: every shape is mirrored and their places swap over
+  // with them, so the arrangement comes out as its own mirror image. One shape on its own is the
+  // wall-aware flip() above — this is the plate's version of the same act.
+  flipSelection(axis = 'x') {
+    const start = this._groupStart();
+    if (start.length < 2) return false;
+    const b = this.selBounds();
+    if (!b) return false;
+    const line = axis === 'x' ? b.cx : b.cy;
+    if (!this._editableSelection()) return false;
+    this._record();
+    for (const s of start) this._mirrorLayer(s.l, axis, line);
+    if (!this._groupAllowed(start)) {
+      for (const s of start) {
+        s.l.shape = { outer: s.outer, inner: s.inner }; s.l.symOrigin = { ...s.origin };
+        s.l.rev++; s.l._disp = null;
+      }
+      this.undoStack.pop();
+      this._blockNote(BLOCK_MSG);
+      return false;
+    }
+    this._autoFit();
+    this._changed();
+    return true;
+  }
+
+  // Mirror one layer about a line that is not its own. A symmetric shape is the interesting case:
+  // its half is drawn on one side of its own mirror line, so mirroring the half about a line
+  // parallel to that one would leave it on the wrong side. It does not have to be: the shape is
+  // already its own mirror image that way, so mirroring it is the same thing as moving it.
+  _mirrorLayer(l, axis, line) {
+    const f = axis === 'x' ? (p) => ({ x: 2 * line - p.x, y: p.y }) : (p) => ({ x: p.x, y: 2 * line - p.y });
+    const parallel = axis === 'x' ? l.sym.x : l.sym.y;
+    if (parallel) {
+      const o = f(l.symOrigin);
+      this._shiftLayer(l, o.x - l.symOrigin.x, o.y - l.symOrigin.y);
+      return;
+    }
+    const symOn = l.sym.x || l.sym.y;
+    const fix = (pts, k) => {
+      const r = mapPts(pts, f);
+      // A mirrored half keeps its ends on the mirror line; a closed ring keeps its winding.
+      if (symOn) return this._reverse(r);
+      if (!l.open[k] && r.length >= 3 && signedArea(r) < 0) return this._reverse(r);
+      return r;
+    };
+    l.shape = { outer: fix(l.shape.outer, 'outer'), inner: fix(l.shape.inner, 'inner') };
+    l.symOrigin = f(l.symOrigin);
+    l.rev++; l._disp = null;
+  }
+
+  // A locked shape cannot be in the selection at all, so this is only ever true — it is here so
+  // that a selection built before a shape was locked can never act on it.
+  _editableSelection() {
+    const bad = this._selLayers().some(l => l.locked);
+    if (bad) this._blockNote('One of those shapes is locked — unlock it in the shapes list first.', false);
+    return !bad;
+  }
+
+  // Lay the shapes out again: rows of shapes in the middle of the canvas, each one clear of its
+  // neighbours by the gap the guard asks for, biggest first. Locked shapes are not moved — they
+  // are what the block is put beside. Nothing is rotated: the shapes are the user's, only their
+  // places are ours to decide.
+  arrangeShapes() {
+    const items = [];
+    for (const l of this.layers) {
+      const o = l.locked ? null : this._displayOf(l).outer;
+      if (!o || o.length < 3) continue;
+      const b = bounds(o), pad = this._baseWidthOf(l) + SHAPE_GAP / 2;
+      items.push({ l, b, w: b.width + 2 * pad, h: b.height + 2 * pad });
+    }
+    if (items.length < 2) return 0;
+    // Shelves: the tallest shapes first, filled into rows about as wide as the block is meant to
+    // be square. It is not the tightest packing there is, but it is the one you can look at and
+    // see why each shape is where it is.
+    const order = items.slice().sort((a, b) => b.h - a.h || b.w - a.w);
+    const area = order.reduce((n, it) => n + it.w * it.h, 0);
+    const maxW = Math.max(Math.sqrt(area) * 1.3, ...order.map(it => it.w));
+    const rows = [];
+    for (const it of order) {
+      let row = rows[rows.length - 1];
+      if (!row || row.w + it.w > maxW + 1e-9) { row = { items: [], w: 0, h: 0 }; rows.push(row); }
+      row.items.push(it); row.w += it.w; row.h = Math.max(row.h, it.h);
+    }
+    const totalH = rows.reduce((n, r) => n + r.h, 0);
+    let y = -totalH / 2;
+    for (const r of rows) {
+      let x = -r.w / 2;
+      for (const it of r.items) { it.tx = x + it.w / 2; it.ty = y + r.h / 2; x += it.w; }
+      y += r.h;
+    }
+    // Locked shapes keep their places, so the block goes beside them rather than over them.
+    let sx = 0, sy = 0;
+    const fixed = this.layers.filter(l => l.locked && this._displayOf(l).outer.length >= 3);
+    if (fixed.length) {
+      const fb = bounds(fixed.map(l => this._displayOf(l).outer).flat());
+      const fpad = Math.max(...fixed.map(l => this._baseWidthOf(l))) + SHAPE_GAP;
+      const box = {
+        minX: Math.min(...items.map(it => it.tx - it.w / 2)), maxX: Math.max(...items.map(it => it.tx + it.w / 2)),
+        minY: Math.min(...items.map(it => it.ty - it.h / 2)), maxY: Math.max(...items.map(it => it.ty + it.h / 2)),
+      };
+      const clear = box.minX - fpad > fb.maxX || box.maxX + fpad < fb.minX
+                 || box.minY - fpad > fb.maxY || box.maxY + fpad < fb.minY;
+      if (!clear) { sx = fb.maxX + fpad - box.minX; sy = (fb.minY + fb.maxY) / 2 - (box.minY + box.maxY) / 2; }
+    }
+    let moved = 0;
+    this._record();
+    for (const it of items) {
+      const dx = it.tx + sx - it.b.cx, dy = it.ty + sy - it.b.cy;
+      if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) continue;
+      this._shiftLayer(it.l, dx, dy);
+      moved++;
+    }
+    if (!moved) { this.undoStack.pop(); return 0; }
+    this._keepOutCache = { key: null, polys: [] };
+    this._autoFit();
+    this._changed();
+    return items.length;
   }
 
   // Flipping follows the wall you are editing: the outer wall carries the inner one with it,
   // the inner wall flips on its own inside the shape.
   flip(axis) {
+    if (!this._editable()) return;
     const keys = this._affected();
     const ref = this._activeOutline();
     if (ref.length < 3) return;
@@ -859,6 +1215,7 @@ export class ShapeEditor {
   // Line the inner wall up against the outer one: h/v are 'start' | 'center' | 'end'
   // (left/centre/right and top/middle/bottom in screen terms).
   alignInner(h = 'center', v = 'center') {
+    if (!this._editable()) return;
     const disp = this._display();
     if (disp.outer.length < 3 || disp.inner.length < 3) return;
     const o = bounds(disp.outer), i = bounds(disp.inner);
@@ -884,10 +1241,10 @@ export class ShapeEditor {
   }
 
   // Is there a wall here to round? What the toolbar button is enabled by.
-  get canRound() { return flatten(this.points, !this._openWall()).length >= 3; }
+  get canRound() { return !this.layer.locked && flatten(this.points, !this._openWall()).length >= 3; }
 
   beginRound() {
-    if (this.round || !this.canRound) return null;
+    if (this.round || !this.canRound || !this._editable()) return null;
     const k = this.active, base = copy(this.shape[k]);
     // The slider opens where the shape already stands, so it can be turned both ways: down to
     // sharp corners as readily as up to round ones.
@@ -968,6 +1325,7 @@ export class ShapeEditor {
 
   // Switching symmetry: bake the current full shape, then keep only the editable part as the seed.
   setSymmetry(sym) {
+    if (!this._editable()) return;
     this._dropRound();
     const next = { x: !!sym.x, y: !!sym.y };
     if (next.x === this.sym.x && next.y === this.sym.y) return;
@@ -1017,7 +1375,7 @@ export class ShapeEditor {
   selectPoint(i) { this._select(i); this.requestRender(); }
 
   deletePoint(i = this.selected) {
-    if (i < 0 || i >= this.points.length) return;
+    if (!this._editable() || i < 0 || i >= this.points.length) return;
     // A closed outline has to stay a polygon; a half needs two ends; an outline still being
     // drawn may be taken apart down to nothing — it is not holding anything up yet.
     const min = this.symOn ? 2 : this.open[this.active] ? 0 : 3;
@@ -1031,7 +1389,7 @@ export class ShapeEditor {
   // mode: 'add' (curve handles from the neighbours), 'reset' (same, recomputed), 'remove'
   setCurve(i = this.selected, mode = 'add') {
     const pts = this.points;
-    if (i < 0 || i >= pts.length) return;
+    if (!this._editable() || i < 0 || i >= pts.length) return;
     this._record();
     const run = () => {
     const p = pts[i];
@@ -1054,7 +1412,7 @@ export class ShapeEditor {
   // Move a point to an absolute position (properties panel, arrow keys).
   movePoint(i, x, y, { record = true } = {}) {
     const p = this.points[i];
-    if (!p || !isFinite(x) || !isFinite(y)) return;
+    if (!p || !this._editable() || !isFinite(x) || !isFinite(y)) return;
     if (record) this._record();
     const c = this._clamp({ x, y });
     if (!this._guard(() => { const q = this.points[i]; q.x = c.x; q.y = c.y; }, BLOCK_MSG)) {
@@ -1074,7 +1432,7 @@ export class ShapeEditor {
   // Set one Bézier handle as an offset from its anchor (properties panel).
   setHandle(i, which, x, y) {
     const p = this.points[i];
-    if (!p || !p[which] || !isFinite(x) || !isFinite(y)) return;
+    if (!p || !p[which] || !this._editable() || !isFinite(x) || !isFinite(y)) return;
     this._record();
     const run = () => { const q = this.points[i]; q[which] = { x, y }; this._mirrorHandle(q, which); };
     if (!this._guard(run, BLOCK_MSG)) { this.undoStack.pop(); return; }
@@ -1092,7 +1450,7 @@ export class ShapeEditor {
 
   setSmooth(i = this.selected, smooth = true) {
     const p = this.points[i];
-    if (!p) return;
+    if (!p || !this._editable()) return;
     this._record();
     p.smooth = !!smooth;
     if (p.smooth && p.in && p.out) {
@@ -1149,19 +1507,25 @@ export class ShapeEditor {
   // which wall. Wall settings have no undo of their own, so a layer that is still here keeps
   // the settings it has now — only a layer being brought back from the dead gets its own again.
   _snapshot() {
-    return { layers: this.layers.map(copyLayer), index: this.index, active: this.active };
+    // Which shapes were held goes in the step as well: undoing an align or a group move and
+    // finding the shapes let go of would mean selecting them all over again to try once more.
+    return { layers: this.layers.map(copyLayer), index: this.index, active: this.active, sel: [...this.sel] };
   }
 
   _restore(snap) {
     const now = new Map(this.layers.map(l => [l.id, l]));
     this.layers = snap.layers.map(l => {
       const out = copyLayer(l), cur = now.get(l.id);
-      if (cur) { out.params = cur.params; out.bridgeAuto = cur.bridgeAuto; out.rev = cur.rev; }
+      if (cur) { out.params = cur.params; out.bridgeAuto = cur.bridgeAuto; out.locked = cur.locked; out.rev = cur.rev; }
       out.rev++;
       return out;
     });
     this.index = Math.min(Math.max(0, snap.index), this.layers.length - 1);
-    this.picked = true;
+    // Layer ids survive a copy, so the shapes that were held are the same shapes — bar any that
+    // have been deleted since. With none of them left it is the shape being edited, as ever.
+    const ids = new Set(this.layers.filter(l => !l.locked).map(l => l.id));
+    this.sel = new Set((snap.sel || []).filter(id => ids.has(id)));
+    if (!this.sel.size) this._hold();
     this.active = snap.active === 'inner' && this.shape.inner.length >= 3 ? 'inner' : 'outer';
   }
 
@@ -1258,17 +1622,20 @@ export class ShapeEditor {
   // out once and reused — the other layers do not move while you are dragging this one.
   _baseWidthOf(l) { return Math.max(l.params.bladeWidth, l.params.baseWidth); }
 
-  _keepOut() {
-    const mine = this._baseWidthOf(this.layer);
-    const key = this.layers.map((l, i) => (i === this.index ? '' : `${l.id}:${l.rev}:${this._baseWidthOf(l)}`)).join('|') + `#${mine}`;
+  // `exclude` is what is being moved — the shape being edited, or every shape in the selection —
+  // and `mine` the widest base among them.
+  _keepOut(exclude = null, mine = null) {
+    const skip = exclude || new Set([this.index]);
+    const w = mine ?? this._baseWidthOf(this.layer);
+    const key = this.layers.map((l, i) => (skip.has(i) ? '' : `${l.id}:${l.rev}:${this._baseWidthOf(l)}`)).join('|') + `#${w}`;
     if (this._keepOutCache.key === key) return this._keepOutCache.polys;
     const polys = [];
     for (let i = 0; i < this.layers.length; i++) {
-      if (i === this.index) continue;
+      if (skip.has(i)) continue;
       const o = this._displayOf(this.layers[i]).outer;
       if (o.length < 3) continue;
       try {
-        const grown = offsetPolygon(o, this._baseWidthOf(this.layers[i]) + mine + SHAPE_GAP);
+        const grown = offsetPolygon(o, this._baseWidthOf(this.layers[i]) + w + SHAPE_GAP);
         if (grown && grown.length >= 3) polys.push(grown);
       } catch { /* an outline Clipper cannot grow is the builder's problem, not the guard's */ }
     }
@@ -1311,12 +1678,12 @@ export class ShapeEditor {
   }
 
   // Say it once: a drag would otherwise repeat the same sentence sixty times a second.
-  _blockNote(msg) {
+  _blockNote(msg, overlap = true) {
     if (!msg) return;
     const now = performance.now();
     if (this._lastBlock === msg && now - this._lastBlockAt < 1500) return;
     this._lastBlock = msg; this._lastBlockAt = now;
-    this.onBlock(msg);
+    this.onBlock(msg, overlap);
   }
 
   // Is the active layer, exactly as it stands this instant, clear of the others? The display
@@ -1498,8 +1865,10 @@ export class ShapeEditor {
   }
 
   _bboxHandles() {
-    // Nothing held: no box, no handles, and nothing for a drag to catch hold of.
-    if (!this.picked) return null;
+    // Nothing held: no box, no handles, and nothing for a drag to catch hold of. Several shapes
+    // held: the group gets a box of its own (_renderSelBox) and may be moved, but not resized —
+    // one size box over cutters that each have their own size would be a riddle.
+    if (!this.picked || this.multi || this.locked) return null;
     const b = this._editBounds();
     if (!b) return null;
     const tl = this.toPx({ x: b.minX, y: b.minY }), br = this.toPx({ x: b.maxX, y: b.maxY });
@@ -1570,6 +1939,14 @@ export class ShapeEditor {
     return inPoly(this._display()[this.active], mm);
   }
 
+  // Inside any of the shapes being held — what a drag on a multiple selection catches hold of.
+  _insideSelection(mm) {
+    return this._selLayers().some(l => {
+      const o = this._displayOf(l).outer;
+      return o.length >= 3 && inPoly(o, mm);
+    });
+  }
+
   // Which shape is under the pointer, by its outline: the one being edited first — it is drawn
   // on top of the others — then the rest, topmost first. An outline still being placed is not a
   // shape yet and cannot be picked up.
@@ -1577,6 +1954,7 @@ export class ShapeEditor {
     const order = [this.index];
     for (let i = this.layers.length - 1; i >= 0; i--) if (i !== this.index) order.push(i);
     for (const i of order) {
+      if (this.layers[i].locked) continue;   // out of reach: a click goes through it
       const outer = this._displayOf(this.layers[i]).outer;
       if (outer.length >= 3 && inPoly(outer, mm)) return i;
     }
@@ -1635,7 +2013,9 @@ export class ShapeEditor {
       if (h) return { kind: 'scale', h, hb, cursor: h.cursor };
     }
     const mm = this.toMm(px);
-    if (hb && this._insideShape(mm)) return { kind: 'move', hb, cursor: 'move' };
+    if (this.multi) {
+      if (this._insideSelection(mm)) return { kind: 'move', cursor: 'move' };
+    } else if (hb && this._insideShape(mm)) return { kind: 'move', hb, cursor: 'move' };
     // Any other shape under the pointer is what a click picks up. The shape already in hand
     // counts as one too — you can be over it without being over the wall you are moving (its
     // inner one) — and picking it up again does nothing, which is better than letting go of it.
@@ -1681,7 +2061,8 @@ export class ShapeEditor {
     }
     // Nothing in hand, nothing to pinch: with the shape put down the two-finger gesture has no
     // more business reshaping it than the handles have being on screen.
-    if (this.pointers.size === 2 && !this.panMode && this.picked && this.points.length >= 3 && !this.symOn) {
+    if (this.pointers.size === 2 && !this.panMode && this.picked && !this.multi && !this.locked
+        && this.points.length >= 3 && !this.symOn) {
       this.stroke = null; this.drag = null;
       const [a, b] = [...this.pointers.values()];
       this.gesture = { start: this._startState(), d0: Math.hypot(b.x - a.x, b.y - a.y),
@@ -1722,9 +2103,23 @@ export class ShapeEditor {
     }
 
     if (this.tool === 'draw') {
-      if (rightClick) return;
+      if (rightClick || !this._editable()) return;
       this.stroke = [this._snapPoint(mm, { grid: false })];
     } else if (this.tool === 'points') {
+      if (!this._editable()) return;
+      // Alt/Option on a corner that is already there redraws its curve: the same place-and-pull
+      // that shapes a corner as it goes down, offered again on one placed a while ago. It looks
+      // for the corner itself rather than taking `hit` — over a short handle the tip is what the
+      // pointer is nearest, and this gesture is about the corner, not one of its two handles.
+      const altVi = e.altKey && !rightClick ? this._hitVertex(px) : -1;
+      if (altVi >= 0) {
+        this._select(altVi);
+        this._record();
+        // `rec` says the undo step is this drag's own: a pull that never happens pops it again.
+        this.drag = { kind: 'pen', index: altVi, c0: { x: e.clientX, y: e.clientY }, pulled: false, rec: true };
+        this._setCursor('crosshair');
+        return;
+      }
       if (hit.kind === 'handle') {
         if (rightClick) return;
         this._record(); this.drag = { kind: 'handle', which: hit.which, index: this.selected }; this._setCursor('move'); return;
@@ -1781,24 +2176,84 @@ export class ShapeEditor {
       this._changed();
     } else if (this.tool === 'move') {
       if (rightClick) return;
+      // ⌘ on a Mac, Ctrl elsewhere: the press adds the shape to what is held, or takes it back
+      // out again, instead of replacing the selection with it.
+      const toggle = e.metaKey || e.ctrlKey;
       if (hit.kind === 'rotate') { this._record(); this.drag = { kind: 'rotate', start: this._startState(), c: hit.hb.b, a0: Math.atan2(px.y - hit.hb.center.y, px.x - hit.hb.center.x) }; this._setCursor(hit.cursor); return; }
       if (hit.kind === 'scale') { this._record(); this.drag = { kind: 'scale', h: hit.h, start: this._startState(), b: hit.hb.b, p0: mm }; this._setCursor(hit.cursor); return; }
       if (hit.kind === 'move') {
-        this.drag = { kind: 'move', start: this._startState(), p0: mm, b0: bounds(this._display()[this.active]) }; this._setCursor('move');
+        // ⌘-click on a shape that is already held takes that one back out of the selection.
+        const i = toggle ? this._layerAt(mm) : -1;
+        if (i >= 0) { this.pickShape(i, 'toggle'); this.dirty = true; return; }
+        this.drag = this._moveDrag(mm);
+        if (this.drag) this._setCursor('move');
       } else if (hit.kind === 'pick') {
         // A press on another shape picks it up, and the same press goes on to move it: laying
         // out a plate is then one gesture per shape, not a click and then a drag. Only while
-        // the outer wall is the one being edited — that is the outline just pressed on.
-        const picked = this.pickShape(hit.layer);
-        if (picked && this.active === 'outer' && this._display().outer.length >= 3) {
-          this.drag = { kind: 'move', start: this._startState(), p0: mm, b0: bounds(this._display().outer) }; this._setCursor('move');
+        // the outer wall is the one being edited — that is the outline just pressed on — and
+        // never while ⌘ is down, which is a press about the selection and not about moving.
+        const picked = this.pickShape(hit.layer, toggle ? 'toggle' : 'only');
+        if (picked && !toggle && this.active === 'outer') {
+          this.drag = this._moveDrag(mm);
+          if (this.drag) this._setCursor('move');
         }
       } else if (hit.kind === 'none') {
-        // Empty canvas: the shape is put down. Nothing is held until a shape is clicked again.
-        if (this.dropShape()) this._setCursor('default');
+        // Shift on the empty canvas draws a rectangle round the shapes instead: everything it
+        // runs into is what is held when it is let go.
+        if (e.shiftKey) {
+          this.drag = { kind: 'marquee', p0: px, add: toggle };
+          this.marquee = { a: mm, b: mm };
+          this._setCursor('crosshair');
+        } else if (this.dropShape()) this._setCursor('default');
       }
     }
     this.dirty = true;
+  }
+
+  // A move drag: the whole selection when several shapes are held, the wall being edited when
+  // one is. Null when there is nothing to move — a locked shape, or a wall with no contour.
+  _moveDrag(mm) {
+    if (this.multi) {
+      const b = this.selBounds();
+      return b ? { kind: 'move', group: this._groupStart(), p0: mm, b0: b } : null;
+    }
+    if (!this._editable()) return null;
+    const pts = this._display()[this.active];
+    if (pts.length < 3) return null;
+    return { kind: 'move', start: this._startState(), p0: mm, b0: bounds(pts) };
+  }
+
+  // Everything the rectangle runs into becomes the selection — or joins it, with ⌘ held. Locked
+  // shapes are passed by, and a rectangle that catches nothing puts the shapes down.
+  selectInRect(a, b, { add = false } = {}) {
+    if (!this.canHoldMany) return 0;
+    const minX = Math.min(a.x, b.x), maxX = Math.max(a.x, b.x);
+    const minY = Math.min(a.y, b.y), maxY = Math.max(a.y, b.y);
+    const rect = [{ x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY }];
+    const hit = [];
+    for (let i = 0; i < this.layers.length; i++) {
+      const l = this.layers[i];
+      if (l.locked) continue;
+      const o = this._displayOf(l).outer;
+      if (o.length < 3) continue;
+      const bb = bounds(o);
+      if (bb.maxX < minX || bb.minX > maxX || bb.maxY < minY || bb.minY > maxY) continue;
+      let touches = true;
+      try { touches = intersectPolygons([o], [rect]).length > 0; } catch { /* keep it */ }
+      if (touches) hit.push(i);
+    }
+    if (!hit.length) {
+      if (add || !this.sel.size) return 0;
+      this.sel.clear();
+      this._changed({ selectionOnly: true });
+      return 0;
+    }
+    if (!add) this.sel.clear();
+    for (const i of hit) this.sel.add(this.layers[i].id);
+    // The anchor has to be one of the shapes being held: the settings panel is showing it.
+    if (!this.sel.has(this.layer.id)) this.setLayer(hit[0], { keep: true });
+    else this._changed({ selectionOnly: true });
+    return this.selectionCount;
   }
 
   _openMenu(index, e) {
@@ -1811,8 +2266,12 @@ export class ShapeEditor {
   _move(e) {
     const px = this._eventPos(e);
     if (!this.pointers.has(e.pointerId)) {
-      // plain hover: pick a cursor
-      if (!this.drag && !this.stroke) this._hoverAt(px);
+      // plain hover: pick a cursor. With Alt held over a corner the press would redraw its
+      // curve rather than move it, so the cursor says so before the button goes down.
+      if (!this.drag && !this.stroke) {
+        this._hoverAt(px);
+        if (e.altKey && this.tool === 'points' && !this.panMode && !this.round && this._hitVertex(px) >= 0) this._setCursor('crosshair');
+      }
       return;
     }
     e.preventDefault();
@@ -1831,6 +2290,12 @@ export class ShapeEditor {
       this.view.manual = true;
       this.dirty = true;
       this.onView(this.view);
+      return;
+    }
+
+    if (this.drag && this.drag.kind === 'marquee') {
+      this.marquee = { a: this.toMm(this.drag.p0), b: this.toMm(px) };
+      this.dirty = true;
       return;
     }
 
@@ -1897,9 +2362,14 @@ export class ShapeEditor {
       const s = this._snapPoint(mm, { axis: false, guides: false, clamp: false });
       let h = { x: s.x - p.x, y: s.y - p.y };
       if (e.shiftKey) h = snapAngle45(h);   // Shift: horizontal, vertical or diagonal
+      // Pulled back onto the corner itself — within the same threshold the pull started at —
+      // the corner is plain again and says so: handles of no length bend nothing, but would
+      // still draw it as a curved corner and hand the point bar two zeroes to show.
+      const plain = Math.hypot(h.x, h.y) * this.scale <= PEN_PULL;
       this._guard(() => {
         const q = this.points[d.index];
-        q.out = h; q.in = { x: -h.x, y: -h.y }; q.smooth = true;
+        if (plain) { delete q.out; delete q.in; delete q.smooth; }
+        else { q.out = h; q.in = { x: -h.x, y: -h.y }; q.smooth = true; }
       }, BLOCK_MSG);
       this._changed();
     } else if (d.kind === 'handle') {
@@ -1923,7 +2393,9 @@ export class ShapeEditor {
       // down: a press is also how a shape is picked up, and picking one up changes nothing.
       // The drawing is still untouched here, so the snapshot is of where the drag started.
       if ((dx || dy) && !d.rec) { d.rec = true; this._record(); }
-      this._applyTransform(d.start, p => ({ x: p.x + dx, y: p.y + dy })); this._changed();
+      const move = p => ({ x: p.x + dx, y: p.y + dy });
+      if (d.group) this._applyGroupTransform(d.group, move); else this._applyTransform(d.start, move);
+      this._changed();
     } else if (d.kind === 'rotate') {
       const c = this.toPx({ x: d.c.cx, y: d.c.cy });
       let ang = Math.atan2(px.y - c.y, px.x - c.x) - d.a0;
@@ -1999,12 +2471,22 @@ export class ShapeEditor {
         if (!d.moved && d.menuIndex >= 0) this._openMenu(d.menuIndex, d.ev);
         this.dirty = true; return;
       }
+      if (d.kind === 'marquee') {
+        const a = this.toMm(d.p0), b = this.toMm(px);
+        this.marquee = null;
+        // A Shift-click that never became a rectangle is not an answer about anything.
+        if (Math.hypot(px.x - d.p0.x, px.y - d.p0.y) > 3) this.selectInRect(a, b, { add: d.add });
+        this._hoverAt(px); this.dirty = true; return;
+      }
       if (d.kind === 'guide') { this._hoverAt(px); this.dirty = true; return; }
       if (d.kind === 'vertex' && !d.moved) {
         this.undoStack.pop();
         // A press on the first point that never became a drag is the click that closes the outline.
         if (d.closes) { this.closeContour(); this._hoverAt(px); return; }
       }
+      // An Alt press on a corner that never became a pull: the curve was not redrawn, so the
+      // undo step it took out is handed back and nothing is built.
+      if (d.kind === 'pen' && d.rec && !d.pulled) { this.undoStack.pop(); this._hoverAt(px); this.dirty = true; return; }
       // A press that never moved the shape: it picked it up and nothing else, so there is
       // nothing to fit, to build or to report.
       if (d.kind === 'move' && !d.rec) { this._hoverAt(px); this.dirty = true; return; }
@@ -2042,10 +2524,16 @@ export class ShapeEditor {
 
     // The shapes you are not editing stay on the canvas — you are laying out a plate, not one
     // cutter — but greyed back, because only one of them can be picked up.
-    for (let i = 0; i < this.layers.length; i++) if (i !== this.index) this._renderOther(this.layers[i], i === this.hot);
+    for (let i = 0; i < this.layers.length; i++) if (i !== this.index) this._renderOther(this.layers[i], i);
 
     const disp = this._display();
-    const rings = disp.outer.length >= 3 ? this._ringsFor(this.layer) : null;
+    // A locked shape is not being edited, even while it is the one the settings panel is showing
+    // (every shape on the plate may be locked, and then there is nowhere to step to). It is drawn
+    // like the other shapes that are out of reach, and everything you could take hold of — the
+    // wall bands in full contrast, the corners, the handles, the box — is left off it.
+    const frozen = this.layer.locked;
+    if (frozen) this._renderOther(this.layer, this.index);
+    const rings = !frozen && disp.outer.length >= 3 ? this._ringsFor(this.layer) : null;
     if (rings) {
       const band = (outerRing, innerRing, fill) => {
         if (!outerRing || !innerRing) return;
@@ -2072,7 +2560,7 @@ export class ShapeEditor {
     const dimmed = (k) => this.active !== k && disp.outer.length >= 2 && disp.inner.length >= 2;
     const strokeFor = (k) => dimmed(k) ? C.dimLine : C.doughLine;
     const widthFor = (k) => dimmed(k) ? 1 : 1.5;
-    if (disp.outer.length >= 2) {
+    if (!frozen && disp.outer.length >= 2) {
       ctx.beginPath(); this._path(disp.outer);
       if (disp.inner.length >= 3) this._path(disp.inner);
       if (disp.outer.length >= 3) { ctx.fillStyle = C.dough; ctx.fill('evenodd'); }
@@ -2080,7 +2568,7 @@ export class ShapeEditor {
       ctx.lineWidth = widthFor('outer'); ctx.strokeStyle = strokeFor('outer');
       ctx.setLineDash(this.tool === 'points' && disp.outer.length < 3 ? [4, 4] : []); ctx.stroke(); ctx.setLineDash([]);
     }
-    if (disp.inner.length >= 2) {
+    if (!frozen && disp.inner.length >= 2) {
       ctx.beginPath(); this._path(disp.inner);
       ctx.lineWidth = widthFor('inner'); ctx.strokeStyle = strokeFor('inner');
       ctx.setLineDash(this.tool === 'points' && disp.inner.length < 3 ? [4, 4] : []); ctx.stroke(); ctx.setLineDash([]);
@@ -2099,18 +2587,19 @@ export class ShapeEditor {
     }
 
     // in symmetry mode also show the raw edited half of the active contour
-    if (this.symOn && this.tool === 'points' && this.points.length >= 2) {
+    if (this.symOn && this.tool === 'points' && !frozen && this.points.length >= 2) {
       const seg = flatten(this.points, false);
       ctx.beginPath();
       const p0 = this.toPx(seg[0]); ctx.moveTo(p0.x, p0.y);
       for (const p of seg) { const q = this.toPx(p); ctx.lineTo(q.x, q.y); }
       ctx.lineWidth = 1; ctx.strokeStyle = C.accent; ctx.setLineDash([3, 3]); ctx.stroke(); ctx.setLineDash([]);
     }
-    this._renderDraft();
+    if (!frozen) this._renderDraft();   // _renderOther drew the locked one's unfinished outline
     this._renderSymmetry();
     this._renderGuides();
-    if (this.tool === 'points') this._renderVertices();
-    if (this.tool === 'move') this._renderBox();
+    if (this.tool === 'points' && !frozen) this._renderVertices();
+    if (this.tool === 'move') { this._renderBox(); this._renderSelBox(); }
+    this._renderMarquee();
     if (disp.outer.length >= 3) this._renderDims(disp.outer);
   }
 
@@ -2135,13 +2624,17 @@ export class ShapeEditor {
   // A layer that is not being edited: the same picture in grey, faint enough to read as
   // background, with its base band left in so you can see how close it is to the one you
   // are moving — which is what decides whether the move is allowed at all.
-  _renderOther(layer, hot = false) {
+  _renderOther(layer, i) {
     const disp = this._displayOf(layer);
     const ctx = this.ctx, C = this.colors;
-    // Under the pointer it comes a step forward: this is the shape a click would pick up, and
-    // seeing which one that is before pressing is the whole point of the lift.
-    const line = hot ? C.hotLine : C.otherLine, fill = hot ? C.hotFill : C.otherFill;
-    const baseFill = hot ? C.hotBase : C.otherBase, bladeFill = hot ? C.hotBlade : C.otherBlade;
+    const hot = i === this.hot, held = this.sel.has(layer.id), locked = !!layer.locked;
+    // Three states beside plain grey: held with the shape being edited (it moves with it, so it
+    // is drawn in the accent), under the pointer (a step towards that, so you can see what a
+    // click would pick up), and locked (grey with a dashed outline — nothing here can be grabbed).
+    const line = locked ? C.lockLine : held ? C.selLine : hot ? C.hotLine : C.otherLine;
+    const fill = locked ? C.lockFill : held ? C.selFill : hot ? C.hotFill : C.otherFill;
+    const baseFill = locked ? C.lockBase : held ? C.selBase : hot ? C.hotBase : C.otherBase;
+    const bladeFill = locked ? C.lockBlade : held ? C.selBlade : hot ? C.hotBlade : C.otherBlade;
     // An outline someone started and has not closed is still theirs: it stays on the canvas,
     // greyed back like the rest of the shape, instead of vanishing when you step away from it.
     for (const k of ['outer', 'inner']) {
@@ -2169,9 +2662,21 @@ export class ShapeEditor {
         ctx.fillStyle = baseFill; ctx.fill();
       }
     }
-    ctx.lineWidth = hot ? 1.5 : 1; ctx.strokeStyle = line; ctx.lineJoin = 'round';
+    ctx.lineWidth = hot || held ? 1.5 : 1; ctx.strokeStyle = line; ctx.lineJoin = 'round';
+    if (locked) ctx.setLineDash([2, 3]);
     ctx.beginPath(); this._path(disp.outer); ctx.stroke();
     if (hasInner) { ctx.beginPath(); this._path(disp.inner); ctx.stroke(); }
+    ctx.setLineDash([]);
+    if (locked) this._renderLock(disp.outer);
+  }
+
+  // A small padlock in the corner of a locked shape, so the dashed outline has a reason on it.
+  _renderLock(outer) {
+    const ctx = this.ctx, b = bounds(outer), q = this.toPx({ x: b.maxX, y: b.minY });
+    const x = q.x - 5, y = q.y + 5, w = 7, h = 5;
+    ctx.strokeStyle = this.colors.lockLine; ctx.lineWidth = 1.4; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.rect(x - w / 2, y, w, h); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, w / 2 - 1.2, Math.PI, 0); ctx.stroke();
   }
 
   // The scale bar that used to be painted here now lives in the grid control at the canvas'
@@ -2316,6 +2821,34 @@ export class ShapeEditor {
       if (corner) { ctx.beginPath(); ctx.rect(h.x - r, h.y - r, 2 * r, 2 * r); ctx.fill(); ctx.stroke(); }
       else { ctx.beginPath(); ctx.arc(h.x, h.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
     }
+  }
+
+  // Several shapes held at once: one box round the lot, with no handles on it. It says what is
+  // being moved and what Center, Align and Flip would act on — resizing several cutters through
+  // one box is not offered, because each of them has a size of its own.
+  _renderSelBox() {
+    if (!this.multi) return;
+    const b = this.selBounds();
+    if (!b) return;
+    const ctx = this.ctx, C = this.colors;
+    const tl = this.toPx({ x: b.minX, y: b.minY }), br = this.toPx({ x: b.maxX, y: b.maxY });
+    ctx.save();
+    ctx.setLineDash([2, 5]); ctx.lineWidth = 1.2; ctx.strokeStyle = C.accent; ctx.lineCap = 'round';
+    ctx.strokeRect(tl.x - 4, tl.y - 4, br.x - tl.x + 8, br.y - tl.y + 8);
+    ctx.restore();
+  }
+
+  _renderMarquee() {
+    const m = this.marquee;
+    if (!m) return;
+    const ctx = this.ctx, C = this.colors;
+    const a = this.toPx(m.a), b = this.toPx(m.b);
+    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y), w = Math.abs(b.x - a.x), h = Math.abs(b.y - a.y);
+    ctx.save();
+    ctx.fillStyle = C.accentSoft; ctx.fillRect(x, y, w, h);
+    ctx.setLineDash([5, 4]); ctx.lineWidth = 1.2; ctx.strokeStyle = C.accent;
+    ctx.strokeRect(x, y, w, h);
+    ctx.restore();
   }
 
   _renderDims(outer) {

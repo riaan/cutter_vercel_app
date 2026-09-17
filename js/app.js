@@ -28,8 +28,11 @@ const editor = new ShapeEditor($('drawCanvas'), {
   onSelect: updatePointBar,
   onMenu: openPointMenu,
   onView: syncZoomUI,
-  // The guard has no way of saying that it can be lowered, so the toast does it here.
-  onBlock: (msg) => toast(`${msg} “Allow overlap”, under the shapes list, lets them join instead.`),
+  // The guard has no way of saying that it can be lowered, so the toast does it here. A refusal
+  // that has nothing to do with the guard — a locked shape — is passed on as it stands.
+  onBlock: (msg, overlap = true) => toast(overlap
+    ? `${msg} “Allow overlap”, under the shapes list, lets them join instead.`
+    : msg),
 });
 const viewer = new CutterViewer($('viewer'));
 params = editor.params;
@@ -87,6 +90,14 @@ function autoBridgeWidth(shape) {
     editor.requestRender();
   }
 }
+
+// The same for a shape the panel is not showing — what resetting several shapes at once needs.
+function autoBridgeWidthFor(layer) {
+  if (layer === editor.layer) { autoBridgeWidth(editor.getShape()); return; }
+  const outer = editor.layerList()[editor.layers.indexOf(layer)]?.outer;
+  if (!layer.bridgeAuto || !outer || outer.length < 3) return;
+  layer.params.bridgeWidth = Math.max(0.5, Math.round(bounds(outer).width * 0.1 * 2) / 2);
+}
 $('bridgeAutoBtn').addEventListener('click', () => {
   const on = !editor.layer.bridgeAuto;
   editor.layer.bridgeAuto = on;
@@ -129,7 +140,16 @@ function syncSizeInputs(points) {
 
 function updateHint(shape) {
   const hint = $('drawHint'), text = $('drawHintText');
-  // An outline still being placed comes first: nothing else the hint could say matters while
+  // A locked shape the panel is still showing comes first: nothing else the hint could suggest
+  // can be done to it. This only happens when there is no other shape to step to — every shape
+  // on the plate is locked — and then the canvas answering nothing needs a reason.
+  if (editor.locked) {
+    hint.classList.add('corner');
+    text.innerHTML = '<strong>This shape is locked.</strong> Open the padlock in the shapes list to work on it again, or add another shape.';
+    hint.hidden = false;
+    return;
+  }
+  // An outline still being placed comes next: nothing else the hint could say matters while
   // the one thing to do is finish it.
   const draft = editor.tool === 'points' ? editor.draft : null;
   if (draft && draft.count >= 1) {
@@ -441,7 +461,7 @@ setSaveEnabled(false);
 // ---------- tools ----------
 const TOOL_TIPS = {
   draw: 'Drag to sketch the outline in one go.',
-  points: 'Tap to place corners one after the other, then click the first one again to close the shape. Hold and pull as you place one and it comes out curved. After that, tap a line to insert a corner. Select one to delete it or give it a curve; right-click (or hold) for the menu.',
+  points: 'Tap to place corners one after the other, then click the first one again to close the shape. Hold and pull as you place one and it comes out curved. After that, tap a line to insert a corner. Hold Alt and pull a corner to redraw its curve from scratch. Select one to delete it or give it a curve; right-click (or hold) for the menu.',
   move: 'Drag the shape to move it — hold Shift to keep it on one line. Use the handles to resize, with Alt to resize around the middle, and the top knob to rotate. Arrow keys nudge it by 1 mm. Two fingers pinch and twist. Click another shape to pick that one up instead; click the empty canvas to put it down.',
 };
 // The tool explanation stays behind its (i), which sits in the toolbar beside the three tools:
@@ -504,6 +524,10 @@ function setTool(tool) {
   setToolTipText(TOOL_TIPS[tool] + (editor.symOn ? ' Only the bright side is editable — the mirror side follows.' : ''));
   updatePointBar(null); updateShapeBar(); updateHint(editor.getShape());
   syncRoundBar(); syncSmoothSection(); closeMenu();
+  // Select all and the lock row are the Move tool's; the rows themselves have not changed, so
+  // this is the foot's own business and not a redraw of the list.
+  syncSelectRow();
+  syncWallActions();
 }
 setTool('draw');
 
@@ -520,8 +544,9 @@ function setActive(which) {
   syncRoundBar();
 }
 
-// Centre, align, flip and clear all act on the wall you are editing, so the controls change with
-// it — and they stay out of the way entirely until there is something for them to act on.
+// Centre, align and flip act on the shapes you have selected — one of them, or several held
+// together — and Clear on the wall you are editing. They stay out of the way entirely until
+// there is something for them to act on, and a locked shape is out of reach of all of them.
 function syncWallActions() {
   const inner = editor.active === 'inner';
   const shape = editor.getShape();
@@ -529,31 +554,50 @@ function syncWallActions() {
   // An unfinished outline is not a wall, but it is something: Clear has to be able to get rid
   // of it, and Flip works on the line as it stands.
   const something = hasWall || !!editor.draft;
-  for (const id of ['centerBtn', 'flipXBtn', 'flipYBtn', 'clearBtn', 'shapeActionsDivider']) $(id).hidden = !something;
+  const group = editor.selectionCount > 1;
+  for (const id of ['centerBtn', 'flipXBtn', 'flipYBtn', 'clearBtn', 'shapeActionsDivider']) $(id).hidden = !(something || group);
   // While the tool is open the canvas is showing a preview, so nothing else may change the shape.
   const rounding = !!editor.rounding;
-  for (const id of ['centerBtn', 'flipXBtn', 'flipYBtn', 'clearBtn', 'alignBtn']) $(id).disabled = rounding;
-  $('centerBtn').disabled = inner || rounding;
+  const locked = editor.locked;
+  // With several shapes held the buttons belong to the group, so they do not care whether the
+  // shape the panel happens to be showing has a wall of its own.
+  const one = !group && something && !locked && !rounding && editor.picked;
+  for (const id of ['flipXBtn', 'flipYBtn']) $(id).disabled = !(group ? !rounding : one);
+  $('centerBtn').disabled = group ? rounding : !(one && !inner);
+  $('clearBtn').disabled = rounding || locked || !something;
+  $('alignHBtn').hidden = $('alignVBtn').hidden = !group;
+  for (const id of ['alignHBtn', 'alignVBtn']) $(id).disabled = rounding;
+  // Laying the plate out again is a plate-wide tidy-up, so it appears with the second shape and
+  // does not care what is selected.
+  $('arrangeBtn').hidden = editor.layerCount < 2;
+  $('arrangeBtn').disabled = rounding || editor.unlockedCount < 2;
   syncRoundBar();
-  // Centring moves the whole drawing; on its own the inner wall has Align instead.
-  $('alignWrap').hidden = !inner || !hasWall;
+  // Centring moves the shapes you hold; on its own the inner wall has Align instead.
+  $('alignWrap').hidden = !inner || !hasWall || group;
   if ($('alignWrap').hidden) setAlignMenu(false);
-  $('alignBtn').disabled = !(shape.outer.length >= 3 && shape.inner.length >= 3);
-  setTip($('flipXBtn'), inner
-    ? 'Flip left–right — mirror the inner wall horizontally inside the shape. The outer wall is not touched.'
-    : 'Flip left–right — mirror the whole shape horizontally, inner wall and all, as if held up to a mirror. The size stays the same.');
-  setTip($('flipYBtn'), inner
-    ? 'Flip top–bottom — mirror the inner wall vertically inside the shape. The outer wall is not touched.'
-    : 'Flip top–bottom — mirror the whole shape vertically, inner wall and all. The size stays the same.');
+  $('alignBtn').disabled = !(shape.outer.length >= 3 && shape.inner.length >= 3) || rounding || locked;
+  const n = editor.selectionCount;
+  setTip($('flipXBtn'), group
+    ? `Flip left–right — mirror the ${n} shapes you are holding about the middle of them: each shape is mirrored and they swap sides with it.`
+    : inner
+      ? 'Flip left–right — mirror the inner wall horizontally inside the shape. The outer wall is not touched.'
+      : 'Flip left–right — mirror the whole shape horizontally, inner wall and all, as if held up to a mirror. The size stays the same.');
+  setTip($('flipYBtn'), group
+    ? `Flip top–bottom — mirror the ${n} shapes you are holding about the middle of them: each shape is mirrored and they swap places with it.`
+    : inner
+      ? 'Flip top–bottom — mirror the inner wall vertically inside the shape. The outer wall is not touched.'
+      : 'Flip top–bottom — mirror the whole shape vertically, inner wall and all. The size stays the same.');
   const many = editor.layerCount > 1;
   setTip($('clearBtn'), inner
     ? 'Clear — remove the inner wall only. The outer wall stays. You can undo this.'
     : many
       ? `Clear — empty shape ${editor.index + 1}, inner wall included. The other shapes stay. You can undo this.`
       : 'Clear — remove the whole drawing, inner wall included, and start over. You can undo this.');
-  setTip($('centerBtn'), many
-    ? 'Center — move the whole drawing to the middle of the canvas. Every shape moves together, so they keep their places relative to each other.'
-    : 'Center — move the whole shape to the middle of the canvas. The shape and its size stay the same.');
+  setTip($('centerBtn'), group
+    ? `Center — move the ${n} shapes you are holding to the middle of the canvas. They keep their places relative to each other.`
+    : many
+      ? `Center — move shape ${editor.index + 1} to the middle of the canvas. Select the others too (or press ⌘A) to move the whole plate together.`
+      : 'Center — move the whole shape to the middle of the canvas. The shape and its size stay the same.');
 }
 setActive('outer');
 
@@ -625,9 +669,40 @@ $('roundApplyBtn').addEventListener('click', () => {
 });
 $('roundCancelBtn').addEventListener('click', () => editor.cancelRound());
 
-$('centerBtn').addEventListener('click', () => editor.center());
-$('flipXBtn').addEventListener('click', () => editor.flip('x'));
-$('flipYBtn').addEventListener('click', () => editor.flip('y'));
+// Center, Align and Flip act on what is held: one shape, or the group. Everything that can
+// refuse — a shape that would land on a neighbour — says so itself through onBlock.
+$('centerBtn').addEventListener('click', () => {
+  const n = editor.selectionCount;
+  if (editor.centerSelection() && n > 1) toast(`${n} shapes centred together — they keep their places relative to each other.`);
+});
+$('flipXBtn').addEventListener('click', () => flipHeld('x'));
+$('flipYBtn').addEventListener('click', () => flipHeld('y'));
+function flipHeld(axis) {
+  const n = editor.selectionCount;
+  if (n > 1) { if (editor.flipSelection(axis)) toast(`${n} shapes flipped ${axis === 'x' ? 'left–right' : 'top–bottom'}. You can undo this.`); }
+  else editor.flip(axis);
+}
+$('alignHBtn').addEventListener('click', () => alignHeld('h'));
+$('alignVBtn').addEventListener('click', () => alignHeld('v'));
+function alignHeld(axis) {
+  const n = editor.selectionCount;
+  if (editor.alignSelection(axis)) toast(`${n} shapes lined up on one ${axis === 'h' ? 'horizontal' : 'vertical'} line.`);
+}
+
+// Laying the plate out again: every shape that is not locked goes into rows in the middle of the
+// canvas, clear of its neighbours — which is only true while overlapping is not allowed, so the
+// setting goes off with it. That part is not undoable, so a plate that is using it is asked first.
+$('arrangeBtn').addEventListener('click', async () => {
+  if (editor.allowOverlap) {
+    const ok = await confirmAction('Lay the shapes out again?',
+      'They go into rows in the middle of the canvas, each one clear of its neighbours — so “Allow overlap” goes off with it. Locked shapes stay where they are. The move itself can be undone.', 'Arrange');
+    if (!ok) return;
+  }
+  const n = editor.arrangeShapes();
+  if (!n) { toast('Nothing to lay out — there is only one shape that can be moved.'); return; }
+  setOverlapAllowed(false);
+  toast(`${n} shapes laid out in the middle of the canvas. You can undo the move.`);
+});
 $('clearBtn').addEventListener('click', () => editor.clear());
 $('undoBtn').addEventListener('click', () => editor.undo());
 $('redoBtn').addEventListener('click', () => editor.redo());
@@ -714,6 +789,9 @@ document.addEventListener('keydown', (e) => {
     const [dx, dy] = ARROWS[e.key], step = e.shiftKey ? 5 : 1;   // millimetres
     editor.nudgePoint(dx * step, dy * step);
   }
+  // ⌘A / Ctrl+A holds every shape — the Move tool's, like the row it presses. Elsewhere it does
+  // nothing, but it still may not fall through to the browser selecting the whole page.
+  else if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); if (editor.canHoldMany) $('selectAllBtn').click(); }
   else if (ARROWS[e.key] && editor.tool === 'move' && editor.picked && !editor.rounding) {
     e.preventDefault();
     const [dx, dy] = ARROWS[e.key], step = e.shiftKey ? 5 : 1;   // millimetres
@@ -812,6 +890,12 @@ const showNum = (v) => String(Math.round(v * 1000) / 1000);
 // effective contour, so it has to be handed in; the shapes list already has one per shape.
 const shapeCtx = (layer, inner) => ({ p: layer.params, auto: layer.bridgeAuto, inner: inner.length >= 3 });
 const activeCtx = () => shapeCtx(editor.layer, editor.getShape().inner);
+// The same, for every shape being held: Reset all puts the settings of all of them back, because
+// the shapes list is where you said which shapes you meant.
+function heldCtxs() {
+  const list = editor.layerList();
+  return editor.selection.map(i => ({ i, ctx: shapeCtx(editor.layers[i], list[i].inner) }));
+}
 
 function offDefault(f, c) {
   if (f.when && !f.when(c)) return false;
@@ -832,9 +916,9 @@ function defaultText(f) {
   return showNum(DEFAULT_PARAMS[f.key]) + f.unit;
 }
 // Mutates only; the caller syncs the panel once for the whole lot.
-function applyReset(f) {
-  if (f.auto) editor.layer.bridgeAuto = true;
-  else params[f.key] = DEFAULT_PARAMS[f.key];
+function applyReset(f, layer = editor.layer) {
+  if (f.auto) layer.bridgeAuto = true;
+  else layer.params[f.key] = DEFAULT_PARAMS[f.key];
 }
 
 function syncResetMarks() {
@@ -847,10 +931,21 @@ function syncResetMarks() {
     if (off) { n++; setTip(el, `Reset — the default is ${defaultText(f)}.`); }
     el.hidden = !off;
   }
-  $('resetAllRow').hidden = n === 0;
-  $('resetAllNote').textContent = n === 1
-    ? '1 setting differs from the default'
-    : `${n} settings differ from the defaults`;
+  // With several shapes held the row speaks for all of them — the marks above it still belong to
+  // the one the panel is showing, which is the only one whose numbers are on screen.
+  const held = editor.selectionCount > 1 ? heldCtxs().filter(h => offDefaultCount(h.ctx) > 0) : null;
+  $('resetAllRow').hidden = held ? held.length === 0 : n === 0;
+  $('resetAllNote').textContent = held
+    ? (held.length === 1
+      ? '1 of the shapes you are holding is off the defaults'
+      : `${held.length} of the shapes you are holding are off the defaults`)
+    : n === 1
+      ? '1 setting differs from the default'
+      : `${n} settings differ from the defaults`;
+  $('resetAllLabel').textContent = held ? `Reset ${held.length === 1 ? 'it' : 'them'}` : 'Reset all';
+  setTip($('resetAllBtn'), held
+    ? `Reset — put every setting of the ${held.length === 1 ? 'shape' : `${held.length} shapes`} you are holding back to the app's default. It shows you what would change first.`
+    : "Reset all — put every setting of this shape back to the app's default. It shows you what would change first.");
   syncShapeFlags();   // the same news, one level up: which shapes on the plate are not standard
 }
 
@@ -871,30 +966,42 @@ for (const [key, el] of resetMarks) {
 // All of them at once is a different matter: several numbers change, some of them in sections
 // that are folded away, and wall settings have no undo. So it says what it is about to do first.
 $('resetAllBtn').addEventListener('click', async () => {
-  const c = activeCtx();
-  const list = RESET_FIELDS.filter(f => offDefault(f, c));
-  if (!list.length) return;
-  if (!await confirmReset(list, c)) return;
-  for (const f of list) applyReset(f);
-  autoBridgeWidth(editor.getShape());
+  // One shape or the whole selection — the same dialog either way, with a heading per shape
+  // once there is more than one.
+  const shapes = (editor.selectionCount > 1 ? heldCtxs() : [{ i: editor.index, ctx: activeCtx() }])
+    .map(h => ({ ...h, list: RESET_FIELDS.filter(f => offDefault(f, h.ctx)) }))
+    .filter(h => h.list.length);
+  if (!shapes.length) return;
+  if (!await confirmReset(shapes)) return;
+  for (const h of shapes) for (const f of h.list) applyReset(f, editor.layers[h.i]);
+  // Bar thickness back on auto has to be worked out again, and only the active shape's is in
+  // `params` — the others are read off their own layer.
+  for (const h of shapes) autoBridgeWidthFor(editor.layers[h.i]);
   syncParamInputs();
   onParamsChanged();
   refreshSummaries();
-  toast(list.length === 1
-    ? 'One setting is back to its default.'
-    : `${list.length} settings are back to their defaults.`);
+  const n = shapes.reduce((k, h) => k + h.list.length, 0);
+  toast(shapes.length > 1
+    ? `${n} settings across ${shapes.length} shapes are back to their defaults.`
+    : n === 1
+      ? 'One setting is back to its default.'
+      : `${n} settings are back to their defaults.`);
 });
 
-// Before and after, one row per setting. Resolves false on Cancel, Esc or the backdrop.
-function confirmReset(list, c) {
+// Before and after, one row per setting — and, with more than one shape being reset, a heading
+// per shape over its rows. Resolves false on Cancel, Esc or the backdrop.
+function confirmReset(shapes) {
   const dlg = $('resetDialog');
   const many = editor.layers.length > 1;
-  $('resetTitle').textContent = many
-    ? `Reset the settings for shape ${editor.index + 1}?`
-    : 'Reset the settings?';
-  $('resetBody').textContent = list.length === 1
+  const total = shapes.reduce((n, h) => n + h.list.length, 0);
+  $('resetTitle').textContent = shapes.length > 1
+    ? `Reset the settings for ${shapes.length} shapes?`
+    : many
+      ? `Reset the settings for shape ${shapes[0].i + 1}?`
+      : 'Reset the settings?';
+  $('resetBody').textContent = total === 1
     ? 'One setting goes back to the default:'
-    : `These ${list.length} settings go back to the defaults:`;
+    : `These ${total} settings go back to the defaults:`;
   const table = $('resetTable');
   table.textContent = '';
   const cell = (cls, text) => {
@@ -902,9 +1009,12 @@ function confirmReset(list, c) {
     d.className = cls; d.textContent = text;
     return d;
   };
-  for (const f of list)
-    table.append(cell('rt-name', f.name), cell('rt-from', valueText(f, c)), cell('rt-arrow', '\u2192'), cell('rt-to', defaultText(f)));
-  $('resetOkLabel').textContent = list.length === 1 ? 'Reset' : `Reset ${list.length} settings`;
+  for (const h of shapes) {
+    if (shapes.length > 1) table.append(cell('rt-shape', `Shape ${h.i + 1}`));
+    for (const f of h.list)
+      table.append(cell('rt-name', f.name), cell('rt-from', valueText(f, h.ctx)), cell('rt-arrow', '\u2192'), cell('rt-to', defaultText(f)));
+  }
+  $('resetOkLabel').textContent = total === 1 ? 'Reset' : `Reset ${total} settings`;
   return new Promise((resolve) => {
     const done = (ok) => {
       dlg.removeEventListener('submit', onSubmit);
@@ -1322,7 +1432,10 @@ function shapeThumb(outer, inner) {
 // the list would be rebuilt sixty times a second, outline simplification and all.
 let listShape = '', listTimer = 0;
 function renderShapeList() {
-  const sig = `${editor.layers.length}|${editor.index}`;
+  // Which shapes are held and which are locked shows in the rows, so both belong in the
+  // signature: a ⌘-click that changes neither the plate nor the active shape still redraws.
+  const sig = `${editor.layers.length}|${editor.index}|${editor.selection.join(',')}`
+    + `|${editor.layers.map(l => (l.locked ? 1 : 0)).join('')}`;
   const structural = sig !== listShape;
   listShape = sig;
   clearTimeout(listTimer);
@@ -1335,6 +1448,7 @@ function renderShapeList() {
 function syncOverlapRow() {
   $('overlapBtn').setAttribute('aria-pressed', String(editor.allowOverlap));
   $('shapesFoot').hidden = editor.layerCount < 2 || shapesList.hidden;
+  syncSelectRow();
 }
 
 function drawShapeList() {
@@ -1345,16 +1459,24 @@ function drawShapeList() {
     const name = `Shape ${l.index + 1}`;
     const row = document.createElement('div');
     row.className = 'shape-row';
+    row.classList.toggle('active', l.active);
+    row.classList.toggle('locked', l.locked);
     row.setAttribute('role', 'option');
-    row.setAttribute('aria-selected', String(l.active));
+    // Selected is what the row says; the one being edited is marked on top of that, because the
+    // settings panel can only ever show one of them.
+    row.setAttribute('aria-selected', String(l.selected));
     row.dataset.index = String(l.index);
     row.innerHTML = `<button type="button" class="shape-pick">${shapeThumb(l.outer, l.inner)}<span class="nm"></span>`
       + '<span class="shape-flag" aria-hidden="true" hidden><i class="ph ph-arrow-counter-clockwise"></i></span></button>'
+      + `<button type="button" class="btn ghost small icon shape-lock"><i class="ph ${l.locked ? 'ph-lock-simple' : 'ph-lock-simple-open'}"></i></button>`
       + '<button type="button" class="btn ghost small icon shape-del"><i class="ph ph-trash"></i></button>';
     row.querySelector('.nm').textContent = l.drafting ? `${name} — unfinished` : l.empty ? `${name} — empty` : name;
     const del = row.querySelector('.shape-del');
-    del.hidden = !many;
+    del.hidden = !many || l.locked;
     setTip(del, `Delete ${name} — take this shape off the plate, settings and all. You can undo it.`);
+    setTip(row.querySelector('.shape-lock'), l.locked
+      ? `Unlock ${name} — let it be selected, moved and edited again.`
+      : `Lock ${name} — put it out of reach. It stays on the canvas and in the STL, but cannot be selected, moved or drawn on, and Select all passes it by.`);
     shapesList.append(row);
   }
   syncShapeFlags(list);
@@ -1397,9 +1519,96 @@ shapesList.addEventListener('click', (e) => {
   const row = e.target.closest('.shape-row');
   if (!row) return;
   const i = Number(row.dataset.index);
-  if (e.target.closest('.shape-del')) deleteShape(i);
-  else if (!row.matches('[aria-selected="true"]')) { editor.setLayer(i); toast(`Shape ${i + 1} — the others are greyed out until you come back.`); }
+  if (e.target.closest('.shape-del')) { deleteShape(i); return; }
+  if (e.target.closest('.shape-lock')) { toggleLock(i); return; }
+  if (editor.isLocked(i)) { toast(`Shape ${i + 1} is locked — open the padlock in its row to work on it.`); return; }
+  // ⌘ on a Mac, Ctrl elsewhere: hold this one as well, or let go of it again — under the Move
+  // tool, which is the only one that can hold more than one shape. Elsewhere the modifier means
+  // nothing and the press is the plain one: work on this shape.
+  if ((e.metaKey || e.ctrlKey) && editor.canHoldMany) {
+    const was = editor.selectionCount;
+    if (!editor.pickShape(i, 'toggle')) return;
+    const n = editor.selectionCount;
+    toast(n > was ? `${n} shapes held — Center, Align and Flip act on all of them.` : `${n} shape${n === 1 ? '' : 's'} held.`);
+    return;
+  }
+  if (row.classList.contains('active') && !editor.multi) return;
+  const switching = !row.classList.contains('active');
+  editor.pickShape(i, 'only');
+  if (switching) toast(`Shape ${i + 1} — the others are greyed out until you come back.`);
 });
+
+function toggleLock(i) {
+  const on = !editor.isLocked(i);
+  if (!editor.lockLayer(i, on)) return;
+  toast(on
+    ? `Shape ${i + 1} is locked — it stays on the plate and in the STL, but nothing can move or change it.`
+    : `Shape ${i + 1} is unlocked.`);
+}
+
+// Lock every shape being held in one press. With none held it is the way back: everything on the
+// plate that is locked, let go of at once — a locked shape cannot be held, so "the selected ones"
+// has nothing to point at on the way out.
+$('lockSelBtn').addEventListener('click', () => {
+  const held = editor.selection;
+  if (held.length > 1) {
+    const n = editor.lockLayers(held, true);
+    if (n) toast(`${n} shapes locked — they stay on the plate and in the STL, but nothing can move or change them.`);
+    return;
+  }
+  const locked = editor.lockedLayers;
+  const n = editor.lockLayers(locked, false);
+  if (n) toast(n === 1 ? 'Shape unlocked.' : `${n} shapes unlocked.`);
+});
+
+// Everything on the plate at once, so Center, Align and Flip act on the lot; pressing it again
+// puts the shapes back down. Locked shapes are passed by, so the count says what was taken.
+$('selectAllBtn').addEventListener('click', () => {
+  if (!editor.canHoldMany) return;   // not offered outside the Move tool; here for the shortcut
+  const all = editor.unlockedCount;
+  if (editor.selectionCount >= all && all > 0) { editor.dropShape(); toast('Shapes put down.'); return; }
+  const n = editor.selectAll();
+  if (!n) { toast('Every shape on this plate is locked.'); return; }
+  const skipped = editor.layerCount - n;
+  toast(skipped
+    ? `${n} shapes held — ${skipped} locked shape${skipped === 1 ? ' was' : 's were'} left out.`
+    : `${n} shapes held — Center, Align and Flip act on all of them.`);
+});
+
+// The foot of the shapes list, which follows the tool as much as the plate. Holding shapes is the
+// Move tool's, so Select all and the lock row are simply not there under Draw or Points — a
+// control that cannot do what it says is worse than no control. Unlocking is the exception: it is
+// about the lock, not about the selection, so it is offered wherever there is a lock to open.
+function syncSelectRow() {
+  const move = editor.canHoldMany;
+  const all = editor.unlockedCount, n = editor.selectionCount;
+  const full = all > 0 && n >= all;
+  const selShow = move && all >= 2;
+  $('selectAllBtn').hidden = !selShow;
+  if (selShow) {
+    $('selectAllLabel').textContent = full ? 'Put the shapes down' : 'Select all';
+    $('selCount').textContent = n > 1 ? `${n} held` : '';
+    setTip($('selectAllBtn'), full
+      ? 'Put the shapes down — let go of all of them. The shape you are working on stays the one the settings panel shows.'
+      : 'Select all — hold every shape on the plate at once, so Center, Align and Flip act on the lot. Locked shapes are left out. (⌘A / Ctrl+A)');
+  }
+  // Locking is offered for the shapes you are holding — so only where several can be held at all;
+  // unlocking for the ones that are locked, because a locked shape cannot be held and so cannot be
+  // pointed at that way.
+  const locked = editor.layerCount - all;
+  const mode = move && n > 1 ? 'lock' : locked > 0 ? 'unlock' : null;
+  $('lockSelBtn').hidden = !mode;
+  if (!mode) return;
+  $('lockSelIcon').className = `ph ${mode === 'lock' ? 'ph-lock-simple' : 'ph-lock-simple-open'}`;
+  $('lockSelLabel').textContent = mode === 'lock'
+    ? `Lock these ${n} shapes`
+    : locked === 1 ? 'Unlock the locked shape' : `Unlock all ${locked} shapes`;
+  setTip($('lockSelBtn'), mode === 'lock'
+    ? `Lock these ${n} shapes — put all of them out of reach at once. They stay on the plate and in the STL; the padlock in a row lets one back in.`
+    : locked === 1
+      ? 'Unlock the locked shape — let it be selected, moved and edited again.'
+      : `Unlock all ${locked} shapes — let every locked shape on the plate be selected, moved and edited again.`);
+}
 
 $('addShapeBtn').addEventListener('click', () => {
   editor.addLayer();
@@ -1520,8 +1729,13 @@ function updateShapeBar() {
   // position to show and nothing the numbers would move.
   const pos = editor.tool === 'move' && editor.picked ? editor.shapePos : null;
   if (!pos) { bar.hidden = true; return; }
-  $('shapeBarLabel').textContent = editor.active === 'inner' ? 'Inner wall'
-    : editor.layerCount > 1 ? `Shape ${editor.index + 1}` : 'Shape';
+  const n = editor.selectionCount;
+  $('shapeBarLabel').textContent = n > 1 ? `${n} shapes`
+    : editor.active === 'inner' ? 'Inner wall'
+      : editor.layerCount > 1 ? `Shape ${editor.index + 1}` : 'Shape';
+  setTip($('shapeBar').querySelector('.field-group'), n > 1
+    ? 'Where the middle of the shapes you are holding sits on the canvas. Typing a number moves all of them together; the arrow keys do the same, by 1 mm (5 mm with Shift).'
+    : 'Where the middle of this shape sits on the canvas — x to the right, y downwards, from the middle of the canvas. Arrow keys move it by 1 mm (5 mm with Shift); hold Shift while dragging to keep it on one line.');
   setField('shX', pos.x); setField('shY', pos.y);
   bar.hidden = false;
 }

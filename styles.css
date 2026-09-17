@@ -777,7 +777,15 @@ body {
   background: none; border: 0; border-radius: 6px; cursor: pointer; padding: 4px 6px; min-height: 32px;
 }
 .shape-pick:hover { background: rgba(233, 233, 237, 0.06); color: var(--ink); }
+/* Held — one of the shapes Center, Align and Flip would act on. */
 .shape-row[aria-selected="true"] .shape-pick { color: var(--accent); background: var(--accent-soft); }
+/* And the one being edited on top of that: it is the only one the settings panel can show, so it
+   carries a bar of its own. */
+.shape-row.active .shape-pick { color: var(--accent); box-shadow: inset 2px 0 0 var(--accent); }
+.shape-row.active:not([aria-selected="true"]) .shape-pick { background: rgba(145, 132, 217, 0.08); }
+/* Out of reach: the row says so before the padlock is read. */
+.shape-row.locked .shape-pick { opacity: 0.55; }
+.shape-row.locked .shape-pick:hover { background: none; color: var(--muted); cursor: default; }
 .shape-pick .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* This shape is not on the standard settings — the same arrow the settings panel uses, and a
    marker only: the row it sits in switches shapes. Right-aligned, so the flagged shapes read as
@@ -788,12 +796,15 @@ body {
 .shape-pick .thumb { flex: none; width: 22px; height: 22px; display: block; }
 .shape-pick .thumb path { fill: currentColor; fill-opacity: 0.22; stroke: currentColor; stroke-width: 1.4; stroke-linejoin: round; }
 .shape-pick .thumb.blank { opacity: 0.45; }
-.shape-del { flex: none; opacity: 0; transition: opacity 0.12s ease; }
-.shape-row:hover .shape-del, .shape-row[aria-selected="true"] .shape-del, .shape-del:focus-visible { opacity: 1; }
-@media (prefers-reduced-motion: reduce) { .shape-del { transition: none; } }
+.shape-del, .shape-lock { flex: none; opacity: 0; transition: opacity 0.12s ease; }
+.shape-row:hover .shape-del, .shape-row[aria-selected="true"] .shape-del, .shape-del:focus-visible,
+.shape-row:hover .shape-lock, .shape-row[aria-selected="true"] .shape-lock, .shape-lock:focus-visible { opacity: 1; }
+/* A locked shape wears its padlock all the time — it is the reason the row cannot be used. */
+.shape-row.locked .shape-lock { opacity: 1; color: var(--accent); }
+@media (prefers-reduced-motion: reduce) { .shape-del, .shape-lock { transition: none; } }
 .shape-del[hidden] { display: none; }
-/* No hover on a touch screen, so the trash button cannot hide behind one. */
-@media (hover: none) { .shape-del { opacity: 1; } }
+/* No hover on a touch screen, so neither button can hide behind one. */
+@media (hover: none) { .shape-del, .shape-lock { opacity: 1; } }
 
 /* How the shapes on this plate may sit — a setting for the plate, not for a shape, so it sits
    under the list behind a hairline rather than reading as one more row. */
@@ -808,6 +819,11 @@ body {
 .shapes-overlap span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shapes-overlap:hover { background: rgba(233, 233, 237, 0.06); color: var(--ink); }
 .shapes-overlap[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); }
+/* display:flex beats the browser's own [hidden] rule, so the rows have to say it themselves. */
+.shapes-overlap[hidden] { display: none; }
+.shapes-overlap:disabled { opacity: 0.45; cursor: default; }
+.shapes-overlap:disabled:hover { background: none; color: var(--muted); }
+.sel-count { margin-left: auto; flex: none; font-style: normal; font-size: 11px; color: var(--faint); }
 
 /* Which shape the settings below belong to. */
 .settings-scope {
@@ -840,6 +856,12 @@ body {
 .reset-table .rt-from { color: var(--ink); text-align: right; white-space: nowrap; }
 .reset-table .rt-arrow { color: var(--faint); font-size: 11px; }
 .reset-table .rt-to { color: var(--accent); text-align: right; white-space: nowrap; }
+/* Which shape the rows under it belong to, when more than one is being put back at once. */
+.reset-table .rt-shape {
+  grid-column: 1 / -1; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--hairline);
+  color: var(--ink); font-size: 12px; font-weight: 600;
+}
+.reset-table .rt-shape:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
 
 @media (max-width: 760px) {
   /* On a phone the list would eat the canvas; it starts folded and the header stays. */
