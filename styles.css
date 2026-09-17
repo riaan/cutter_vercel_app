@@ -316,6 +316,16 @@ body {
 .field-grid.rows .field .unit { flex: none; width: 116px; }
 .field-grid[hidden] { display: none; }
 
+/* A setting that is off the app's default carries a small undo arrow. It is a marker first and a
+   button second: seeing which numbers are not the standard ones is most of what it is for. */
+.reset-mark {
+  font: inherit; line-height: 0; padding: 2px; margin-left: 4px; border: 0; border-radius: 5px;
+  background: transparent; color: var(--accent); cursor: pointer; vertical-align: middle;
+}
+.reset-mark i { font-size: 13px; }
+.reset-mark:hover { background: var(--accent-soft); }
+.reset-mark[hidden] { display: none; }
+
 .lock {
   height: 36px; width: 36px; border: 1px solid var(--line); border-radius: var(--radius); background: transparent;
   color: var(--faint); cursor: pointer; display: grid; place-items: center;
@@ -443,6 +453,60 @@ body {
 .dialog h3 { display: flex; align-items: center; gap: 8.4px; margin: 0; font-size: 20px; font-weight: 500; letter-spacing: -0.015em; }
 .dialog h3 i { color: var(--accent); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 5.6px; margin-top: 5.6px; }
+/* Three answers instead of two: Cancel stays on the left, the two ways in sit together on the
+   right. On a narrow window they stack rather than shrink to unreadable labels. */
+.dialog-actions.spread { flex-wrap: wrap; }
+.dialog-actions.spread .spacer { flex: 1 1 auto; }
+@media (max-width: 460px) {
+  .dialog-actions.spread { flex-direction: column-reverse; align-items: stretch; }
+  .dialog-actions.spread .spacer { display: none; }
+  .dialog-actions.spread .btn { justify-content: center; }
+}
+
+/* ---------- dropping a file in ---------- */
+/* The veil covers the window so nothing is lost to the browser opening the file over the top of
+   the drawing; the lit box is the canvas, which is where the file lands. */
+.drop-layer {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(22, 24, 38, 0.72); backdrop-filter: blur(1px);
+}
+.drop-layer[hidden] { display: none; }
+.drop-zone {
+  position: absolute; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; text-align: center; padding: 16.8px;
+  border-radius: var(--radius-lg); border: 2px dashed var(--line);
+  background: rgba(35, 37, 50, 0.85); color: var(--muted);
+  transition: border-color .12s, color .12s, background .12s;
+}
+.drop-zone.hot { border-color: var(--accent); color: var(--ink); background: var(--accent-soft); }
+.drop-zone i { font-size: 30px; color: var(--accent); }
+.drop-zone strong { font-size: 17px; font-weight: 500; letter-spacing: -0.015em; color: var(--ink); }
+.drop-zone span { font-size: 12.5px; }
+
+/* ---------- the loader ---------- */
+/* Reading an STL or a fat SVG blocks the main thread, so this goes up first and says so. */
+.loader {
+  position: fixed; inset: 0; z-index: 60;
+  display: grid; place-items: center;
+  background: rgba(22, 24, 38, 0.78);
+}
+.loader[hidden] { display: none; }
+.loader-box {
+  display: flex; flex-direction: column; align-items: center; gap: 12.6px;
+  padding: 22.4px 28px; border-radius: var(--radius-lg);
+  background: var(--paper); box-shadow: var(--shadow-lg); max-width: min(90vw, 320px);
+}
+.loader-box p { margin: 0; font-size: 13.5px; color: var(--muted); text-align: center; }
+.loader-spin {
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 2.5px solid var(--accent-deep); border-top-color: var(--accent);
+  animation: loader-spin .8s linear infinite;
+}
+@keyframes loader-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .loader-spin { animation-duration: 2.4s; }
+  .drop-zone { transition: none; }
+}
 
 /* ---------- cut-piece preview ---------- */
 /* The stage is a dark worktop; the piece is painted onto it by app.js, so the only job here is
@@ -714,7 +778,13 @@ body {
 }
 .shape-pick:hover { background: rgba(233, 233, 237, 0.06); color: var(--ink); }
 .shape-row[aria-selected="true"] .shape-pick { color: var(--accent); background: var(--accent-soft); }
-.shape-pick .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shape-pick .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* This shape is not on the standard settings — the same arrow the settings panel uses, and a
+   marker only: the row it sits in switches shapes. Right-aligned, so the flagged shapes read as
+   a column rather than as a ragged edge behind the names. */
+.shape-flag { flex: none; line-height: 0; color: var(--accent); }
+.shape-flag i { font-size: 12px; }
+.shape-flag[hidden] { display: none; }
 .shape-pick .thumb { flex: none; width: 22px; height: 22px; display: block; }
 .shape-pick .thumb path { fill: currentColor; fill-opacity: 0.22; stroke: currentColor; stroke-width: 1.4; stroke-linejoin: round; }
 .shape-pick .thumb.blank { opacity: 0.45; }
@@ -725,6 +795,20 @@ body {
 /* No hover on a touch screen, so the trash button cannot hide behind one. */
 @media (hover: none) { .shape-del { opacity: 1; } }
 
+/* How the shapes on this plate may sit — a setting for the plate, not for a shape, so it sits
+   under the list behind a hairline rather than reading as one more row. */
+.shapes-foot { padding: 3px; border-top: 1px solid var(--line); }
+.shapes-foot[hidden] { display: none; }
+.shapes-overlap {
+  display: flex; align-items: center; gap: 7px; width: 100%; min-width: 0;
+  font: inherit; font-size: 12px; color: var(--muted); text-align: left;
+  background: none; border: 0; border-radius: 6px; cursor: pointer; padding: 4px 6px; min-height: 32px;
+}
+.shapes-overlap i { font-size: 16px; width: 22px; text-align: center; flex: none; }
+.shapes-overlap span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shapes-overlap:hover { background: rgba(233, 233, 237, 0.06); color: var(--ink); }
+.shapes-overlap[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); }
+
 /* Which shape the settings below belong to. */
 .settings-scope {
   display: flex; align-items: center; gap: 6px; margin-bottom: 2px;
@@ -734,6 +818,28 @@ body {
 .settings-scope[hidden] { display: none; }
 .settings-scope i { font-size: 14px; color: var(--accent); }
 .settings-scope b { color: var(--ink); font-weight: 600; }
+
+/* Says that this shape is not on the standard settings, and offers to put it back. */
+.settings-reset {
+  display: flex; align-items: center; gap: 8.4px; margin-bottom: 2px;
+  padding: 6px 6px 6px 9px; border-radius: var(--radius); font-size: 12px; color: var(--muted);
+  background: var(--sunken); box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.settings-reset[hidden] { display: none; }
+.settings-reset > i { font-size: 14px; color: var(--accent); flex: none; }
+.settings-reset > span { min-width: 0; }
+.settings-reset .btn { margin-left: auto; flex: none; }
+
+/* Before and after, one row per setting that changes. */
+.reset-table {
+  display: grid; grid-template-columns: 1fr auto auto auto; gap: 2px 8.4px; align-items: baseline;
+  max-height: 46vh; overflow-y: auto; padding: 8.4px; border-radius: var(--radius);
+  background: var(--sunken); box-shadow: inset 0 0 0 1px var(--hairline); font-size: 13px;
+}
+.reset-table .rt-name { color: var(--faint); font-size: 12px; min-width: 0; }
+.reset-table .rt-from { color: var(--ink); text-align: right; white-space: nowrap; }
+.reset-table .rt-arrow { color: var(--faint); font-size: 11px; }
+.reset-table .rt-to { color: var(--accent); text-align: right; white-space: nowrap; }
 
 @media (max-width: 760px) {
   /* On a phone the list would eat the canvas; it starts folded and the header stays. */

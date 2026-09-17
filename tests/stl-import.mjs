@@ -32,6 +32,10 @@ const cases = [
   ['star + small hole', { outer: clean(star), inner: clean(circ(8)) }, { bridgeCount: 3, bridgeWidth: 2.5 }],
   ['wobbly blob + hole', { outer: clean(blob(35, 180, 0.22)), inner: clean(blob(12, 90, 0.18)) }, { bridgeCount: 5, bridgeWidth: 2, bridgeAngle: 22 }],
   ['mirrored model', { outer: clean(star), inner: clean(circ(8)) }, { mirror: true, bridgeAngle: 30 }],
+  // A bar wider than the channel is deep: its thickness is the distance between its own two
+  // sides, and never the narrowest way across the piece, which here is the channel itself.
+  ['ring, connections wider than the channel is deep', { outer: clean(circ(30)), inner: clean(circ(22)) },
+    { bridgeCount: 3, bridgeWidth: 12, bridgeAngle: 10 }],
 ];
 // a starter shape, the way app.js inserts and builds it
 const { PRESETS, PRESET_SIZE_MM } = await import(path.join(root, 'js/presets.js'));
@@ -207,6 +211,161 @@ for (const [label, shape, params] of cases) {
   }
   if (problems.length) { failed++; console.log(`FAIL  a plate of two cutters\n      ${problems.join('\n      ')}`); }
   else console.log(`PASS  a plate of two cutters (${read.parts.length} shapes, ${read.size.width.toFixed(1)} × ${read.size.height.toFixed(1)} mm)`);
+}
+
+// A plate whose shapes were allowed to overlap comes off the printer as one object, so the file
+// holds one welded lump with several cut lines in it. As long as no blade runs through another
+// shape's region, every cut line is still whole and the plate comes back exactly — different
+// heights, different blades and an inner wall included.
+{
+  const at = (pts, dx, dy) => pts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+  const cases = [
+    ['bases overlap, blades 4 mm apart', [
+      { shape: { outer: clean(at(circ(15), -17, 0)), inner: null }, params: P({}) },
+      { shape: { outer: clean(at(circ(15), 17, 0)), inner: null }, params: P({}) },
+    ]],
+    ['bases overlap, one taller, one with a hole', [
+      { shape: { outer: clean(at(circ(18), -20, 0)), inner: clean(at(circ(8), -20, 0)) }, params: P({ height: 12 }) },
+      { shape: { outer: clean(at(circ(15), 18, 0)), inner: null }, params: P({ height: 20, bladeWidth: 0.6 }) },
+    ]],
+  ];
+  for (const [label, plate] of cases) {
+    const built = G.buildAll(plate);
+    const problems = [];
+    if (built.objects !== 1) problems.push(`the plate built as ${built.objects} objects, so it is not the case this is about`);
+    let read;
+    try { read = S.importSTL(G.toBinarySTL(built.positions, 'merged')); }
+    catch (e) { problems.push(e.message); }
+    if (read) {
+      if (read.parts.length !== plate.length) problems.push(`${read.parts.length} shapes instead of ${plate.length}`);
+      else {
+        const byWidth = [...read.parts].sort((a, b) => a.size.width - b.size.width);
+        const want = [...plate].sort((a, b) => G.bounds(a.shape.outer).width - G.bounds(b.shape.outer).width);
+        for (let i = 0; i < plate.length; i++) {
+          for (const k of ['height', 'bladeWidth', 'baseWidth', 'baseHeight', 'ridgeWidth', 'ridgeHeight']) {
+            if (Math.abs(byWidth[i].params[k] - want[i].params[k]) > 0.011) {
+              problems.push(`shape ${i + 1}: ${k} ${byWidth[i].params[k]} vs ${want[i].params[k]}`);
+            }
+          }
+          const hole = want[i].shape.inner ? want[i].shape.inner.length : 0;
+          if (!!byWidth[i].shape.inner.length !== !!hole) problems.push(`shape ${i + 1}: inner wall ${byWidth[i].shape.inner.length} vs ${hole}`);
+        }
+        const again = G.buildAll(read.parts.map(p => ({ shape: p.shape, params: p.params })));
+        const off = Math.abs(again.volumeMm3 - built.volumeMm3) / built.volumeMm3;
+        if (off > 0.004) problems.push(`volume off by ${(off * 100).toFixed(2)}%`);
+      }
+    }
+    if (problems.length) { failed++; console.log(`FAIL  overlapping plate: ${label}\n      ${problems.join('\n      ')}`); }
+    else console.log(`PASS  overlapping plate: ${label} (${read.parts.length} shapes out of one object)`);
+  }
+}
+
+// Blades that run through each other cut the regions into pieces, and the pieces must not come
+// back as shapes — each would be given a wall of its own. Which shape a wall belongs to is read
+// off a second tier: a wall stands on its cut line and grows away from it, so the cut-line edge
+// is in the same place at every tier and the other edge has moved. The shapes come back whole,
+// and the plate rebuilds to the solid it was read from.
+{
+  const at = (pts, dx, dy) => pts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+  for (const dx of [9, 12, 15]) {
+    const plate = [
+      { shape: { outer: clean(at(circ(18), -dx, 0)), inner: null }, params: P({}) },
+      { shape: { outer: clean(at(circ(18), dx, 0)), inner: null }, params: P({}) },
+    ];
+    const built = G.buildAll(plate);
+    const problems = [];
+    if (built.objects !== 1) problems.push('the two shapes did not merge, so this is not the case this is about');
+    let read;
+    try { read = S.importSTL(G.toBinarySTL(built.positions, 'crossed')); }
+    catch (e) { problems.push(e.message); }
+    if (read) {
+      if (read.parts.length !== 2) problems.push(`${read.parts.length} shapes instead of 2`);
+      else {
+        for (const [i, part] of read.parts.entries()) {
+          const b = G.bounds(part.shape.outer);
+          if (Math.abs(b.width - 36) > 0.1 || Math.abs(b.height - 36) > 0.1) {
+            problems.push(`shape ${i + 1}: ${b.width.toFixed(2)} × ${b.height.toFixed(2)} mm, expected 36 × 36`);
+          }
+          // every point of a recovered circle has to sit on the circle it was cut from
+          let worst = 0;
+          for (const q of part.shape.outer) worst = Math.max(worst, Math.abs(Math.hypot(q.x - b.cx, q.y - b.cy) - 18));
+          if (worst > 0.15) problems.push(`shape ${i + 1}: outline off the circle by ${worst.toFixed(3)} mm`);
+          for (const [k, v] of [['bladeWidth', 0.4], ['baseWidth', 3], ['baseHeight', 3], ['ridgeWidth', 0.8], ['ridgeHeight', 7]]) {
+            if (Math.abs(part.params[k] - v) > 0.011) problems.push(`shape ${i + 1}: ${k} ${part.params[k]} vs ${v}`);
+          }
+        }
+        // and the plate builds the very same solid again — cleaned the way app.js cleans it
+        const again = G.buildAll(read.parts.map(p => ({
+          shape: { outer: clean(p.shape.outer), inner: p.shape.inner.length >= 3 ? clean(p.shape.inner) : null },
+          params: p.params,
+        })));
+        const off = Math.abs(again.volumeMm3 - built.volumeMm3) / built.volumeMm3;
+        if (off > 0.004) problems.push(`volume off by ${(off * 100).toFixed(3)}%`);
+        for (const k of ['width', 'height']) {
+          if (Math.abs(again.footprint[k] - built.footprint[k]) > 0.05) {
+            problems.push(`footprint ${k} ${again.footprint[k].toFixed(2)} vs ${built.footprint[k].toFixed(2)}`);
+          }
+        }
+      }
+    }
+    if (problems.length) { failed++; console.log(`FAIL  crossing blades, centres ${2 * dx} mm apart\n      ${problems.join('\n      ')}`); }
+    else console.log(`PASS  crossing blades, centres ${2 * dx} mm apart (2 shapes back out of one object)`);
+  }
+}
+
+// Not every cutter's base grows away from the cut piece. A base flange that overhangs its own cut
+// line runs right round the channel and joins every connection into a single ring — which used to
+// come back as one bar as wide as the shape. The pockets say where the flange ends, and the bars
+// are read in what is left. (Cutter cannot build such a flange, so it is added here as a shape of
+// its own, welded on: a ring standing exactly as tall as the base.)
+{
+  const inner = clean(circ(20));
+  const want = P({ bridgeCount: 3, bridgeWidth: 4, bridgeAngle: 15 });
+  const plate = [
+    { shape: { outer: clean(circ(34)), inner }, params: want },
+    { shape: { outer: inner, inner: null }, params: P({ height: 3, baseHeight: 3, baseWidth: 1.5, bladeWidth: 1.5, ridge: false }) },
+  ];
+  const built = G.buildAll(plate);
+  const problems = [];
+  if (built.objects !== 1) problems.push('the flange did not weld on, so this is not the case this is about');
+  let read;
+  try { read = S.importSTL(G.toBinarySTL(built.positions, 'flange')); }
+  catch (e) { problems.push(e.message); }
+  if (read) {
+    if (read.parts.length !== 1) problems.push(`${read.parts.length} shapes instead of the one cutter`);
+    else {
+      const got = read.parts[0].params;
+      if (got.bridgeCount !== want.bridgeCount) problems.push(`bars ${got.bridgeCount} vs ${want.bridgeCount}`);
+      if (!near(got.bridgeWidth, want.bridgeWidth, 0.05)) problems.push(`bar width ${got.bridgeWidth} vs ${want.bridgeWidth}`);
+      if (!near(got.bridgeAngle, want.bridgeAngle, 0.5)) problems.push(`bar angle ${got.bridgeAngle} vs ${want.bridgeAngle}`);
+    }
+  }
+  if (problems.length) { failed++; console.log(`FAIL  an overhanging base flange does not swallow the connections\n      ${problems.join('\n      ')}`); }
+  else console.log('PASS  an overhanging base flange does not swallow the connections');
+}
+
+// Reading a wall takes a second tier to read it against. A cutter that is nothing but a blade —
+// no base, no step — has only one, so nothing can be told apart: the pieces come back joined, as
+// the one outline around them, and the file says so rather than inventing shapes.
+{
+  const at = (pts, dx, dy) => pts.map(p => ({ x: p.x + dx, y: p.y + dy }));
+  const plate = [
+    { shape: { outer: clean(at(circ(18), -9, 0)), inner: null }, params: P({ baseHeight: 0, ridge: false }) },
+    { shape: { outer: clean(at(circ(18), 9, 0)), inner: null }, params: P({ baseHeight: 0, ridge: false }) },
+  ];
+  const built = G.buildAll(plate);
+  const problems = [];
+  let read;
+  try { read = S.importSTL(G.toBinarySTL(built.positions, 'flat')); }
+  catch (e) { problems.push(e.message); }
+  if (read) {
+    if (read.parts.length !== 1) problems.push(`${read.parts.length} shapes instead of the one outline around them`);
+    if (!read.notes.some(n => /blades running through it/.test(n))) problems.push('nothing was said about what could not be told apart');
+    const b = read.parts[0] && G.bounds(read.parts[0].shape.outer);
+    if (b && Math.abs(b.width - 54) > 0.2) problems.push(`outline ${b.width.toFixed(2)} mm wide, expected 54`);
+  }
+  if (problems.length) { failed++; console.log(`FAIL  one tier: the pieces come back joined, and say so\n      ${problems.join('\n      ')}`); }
+  else console.log('PASS  one tier: the pieces come back joined, and say so');
 }
 
 // optional random stress: node tests/stl-import.mjs 40

@@ -42,7 +42,7 @@
       <span class="ready" id="readyNote">No shape yet</span>
       <div class="pair">
         <button class="btn icon" id="saveProjectBtn" title="Save project — keep this drawing and all its settings as a .cutter file, with the STL and previews inside. Open it later to carry on exactly where you left off." disabled><i class="ph ph-floppy-disk"></i></button>
-        <button class="btn icon" id="openProjectBtn" title="Open project — load a .cutter file you saved earlier, or an STL from before project files existed. It replaces what is on the canvas."><i class="ph ph-folder-open"></i></button>
+        <button class="btn icon" id="openProjectBtn" title="Open project — load a .cutter file you saved earlier, or an STL from before project files existed. With something on the canvas already you are asked whether to add its shapes to the plate or start over."><i class="ph ph-folder-open"></i></button>
       </div>
       <input type="file" id="projectInput" accept=".cutter,application/zip,.stl,model/stl" hidden />
       <button class="btn primary" id="downloadBtn" disabled><i class="ph ph-download-simple"></i>Download STL</button>
@@ -67,7 +67,7 @@
         </div>
         <span class="spacer"></span>
         <div class="toolbar-group">
-          <label class="btn ghost file" title="Import — bring in an outline from an SVG, or rebuild a whole cutter from an STL you made earlier. It replaces what you have drawn.">
+          <label class="btn ghost file" title="Import — bring in an outline from an SVG, or rebuild a whole cutter from an STL you made earlier. With something on the canvas already you are asked whether to add it as another shape or start over. You can also drag the file into the window.">
             <i class="ph ph-upload-simple"></i>Import
             <input type="file" id="svgInput" accept=".svg,image/svg+xml,.stl,model/stl" hidden />
           </label>
@@ -143,6 +143,14 @@
               <button type="button" class="btn ghost small icon" id="addShapeBtn" title="Add shape — another cutter on the same plate, with its own size, walls and settings."><i class="ph ph-plus"></i></button>
             </div>
             <div class="shapes-list" id="shapesList" role="listbox" aria-label="Shapes on this plate"></div>
+            <!-- How the shapes on this plate are allowed to sit: only a plate with something to
+                 run into has anything to allow, so it appears with the second shape. -->
+            <div class="shapes-foot" id="shapesFoot" hidden>
+              <button type="button" class="shapes-overlap" id="overlapBtn" aria-pressed="false"
+                      title="Allow overlap — shapes may run into each other instead of stopping against their neighbours. Where they do they come out as one merged object; the project file still keeps them as separate shapes.">
+                <i class="ph ph-unite"></i><span>Allow overlap</span>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -310,6 +318,14 @@
         <i class="ph ph-stack-simple"></i><span>Settings for <b id="settingsScopeName">Shape 1</b></span>
       </div>
 
+      <!-- Shown only while something really is off the default — an imported cutter usually is,
+           since every number of it was measured off the model. -->
+      <div class="settings-reset" id="resetAllRow" hidden>
+        <i class="ph ph-arrow-counter-clockwise"></i>
+        <span id="resetAllNote">1 setting differs from the default</span>
+        <button class="btn small" type="button" id="resetAllBtn" title="Reset all — put every setting of this shape back to the app's default. It shows you what would change first.">Reset all</button>
+      </div>
+
       <div class="sec">
         <button class="sec-head" type="button" data-sec="size" aria-expanded="true" aria-controls="secSize">
           <i class="ph ph-caret-right caret"></i><span class="name">Size</span><span class="summary" id="sumSize">—</span>
@@ -339,18 +355,18 @@
         <div class="sec-body" id="secWalls">
           <div class="profile-frame"><svg class="profile" id="profile" viewBox="0 0 200 110" aria-hidden="true"></svg></div>
           <div class="field-grid">
-            <label class="field"><span>Cutter height</span><span class="unit"><input type="number" id="pHeight" min="5" max="60" step="0.5" value="15" inputmode="decimal" /><em>mm</em></span></label>
-            <label class="field"><span>Blade thickness</span><span class="unit"><input type="number" id="pBladeWidth" min="0.3" max="4" step="0.1" value="0.4" inputmode="decimal" /><em>mm</em></span></label>
-            <label class="field"><span>Base width</span><span class="unit"><input type="number" id="pBaseWidth" min="1" max="20" step="0.5" value="3" inputmode="decimal" /><em>mm</em></span></label>
-            <label class="field"><span>Base thickness</span><span class="unit"><input type="number" id="pBaseHeight" min="0.5" max="10" step="0.1" value="3" inputmode="decimal" /><em>mm</em></span></label>
+            <label class="field"><span>Cutter height<button class="reset-mark" type="button" data-reset="height" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span><span class="unit"><input type="number" id="pHeight" min="5" max="60" step="0.5" value="15" inputmode="decimal" /><em>mm</em></span></label>
+            <label class="field"><span>Blade thickness<button class="reset-mark" type="button" data-reset="bladeWidth" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span><span class="unit"><input type="number" id="pBladeWidth" min="0.3" max="4" step="0.1" value="0.4" inputmode="decimal" /><em>mm</em></span></label>
+            <label class="field"><span>Base width<button class="reset-mark" type="button" data-reset="baseWidth" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span><span class="unit"><input type="number" id="pBaseWidth" min="1" max="20" step="0.5" value="3" inputmode="decimal" /><em>mm</em></span></label>
+            <label class="field"><span>Base thickness<button class="reset-mark" type="button" data-reset="baseHeight" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span><span class="unit"><input type="number" id="pBaseHeight" min="0.5" max="10" step="0.1" value="3" inputmode="decimal" /><em>mm</em></span></label>
           </div>
           <label class="check">
             <input type="checkbox" id="pRidge" checked />
-            <span>Support step behind the blade <span class="aside">— stiffer, still cuts cleanly</span></span>
+            <span>Support step behind the blade <span class="aside">— stiffer, still cuts cleanly</span><button class="reset-mark" type="button" data-reset="ridge" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span>
           </label>
           <div class="field-grid" id="ridgeFields">
-            <label class="field"><span>Step width</span><span class="unit"><input type="number" id="pRidgeWidth" min="0.4" max="15" step="0.1" value="0.8" inputmode="decimal" /><em>mm</em></span></label>
-            <label class="field"><span>Step height</span><span class="unit"><input type="number" id="pRidgeHeight" min="0.5" max="30" step="0.5" value="7" inputmode="decimal" /><em>mm</em></span></label>
+            <label class="field"><span>Step width<button class="reset-mark" type="button" data-reset="ridgeWidth" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span><span class="unit"><input type="number" id="pRidgeWidth" min="0.4" max="15" step="0.1" value="0.8" inputmode="decimal" /><em>mm</em></span></label>
+            <label class="field"><span>Step height<button class="reset-mark" type="button" data-reset="ridgeHeight" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span><span class="unit"><input type="number" id="pRidgeHeight" min="0.5" max="30" step="0.5" value="7" inputmode="decimal" /><em>mm</em></span></label>
           </div>
         </div>
       </div>
@@ -362,9 +378,9 @@
         <div class="sec-body" id="secInner" hidden>
           <p class="note" id="bridgeNote">Bars at base level hold the inner wall in place. They sit at the top of the cutter in use, so they never touch the clay.</p>
           <div class="field-grid rows" id="bridgeFields">
-            <label class="field"><span>Bars</span><span class="unit"><input type="number" id="pBridgeCount" min="0" max="12" step="1" value="4" inputmode="numeric" /><em>×</em></span></label>
-            <label class="field"><span>Thickness <button type="button" class="mini toggle" id="bridgeAutoBtn" aria-pressed="true" title="Automatic: 10% of the shape's width, rounded to 0.5 mm. Typing a value switches this off.">auto</button></span><span class="unit"><input type="number" id="pBridgeWidth" min="0.5" max="40" step="0.5" value="2" inputmode="decimal" /><em>mm</em></span></label>
-            <label class="field"><span>Rotate</span><span class="unit"><input type="number" id="pBridgeAngle" min="-180" max="180" step="5" value="0" inputmode="numeric" /><em>°</em></span></label>
+            <label class="field"><span>Bars<button class="reset-mark" type="button" data-reset="bridgeCount" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span><span class="unit"><input type="number" id="pBridgeCount" min="0" max="12" step="1" value="4" inputmode="numeric" /><em>×</em></span></label>
+            <label class="field"><span>Thickness<button class="reset-mark" type="button" data-reset="bridgeWidth" hidden><i class="ph ph-arrow-counter-clockwise"></i></button> <button type="button" class="mini toggle" id="bridgeAutoBtn" aria-pressed="true" title="Automatic: 10% of the shape's width, rounded to 0.5 mm. Typing a value switches this off.">auto</button></span><span class="unit"><input type="number" id="pBridgeWidth" min="0.5" max="40" step="0.5" value="2" inputmode="decimal" /><em>mm</em></span></label>
+            <label class="field"><span>Rotate<button class="reset-mark" type="button" data-reset="bridgeAngle" hidden><i class="ph ph-arrow-counter-clockwise"></i></button></span><span class="unit"><input type="number" id="pBridgeAngle" min="-180" max="180" step="5" value="0" inputmode="numeric" /><em>°</em></span></label>
           </div>
         </div>
       </div>
@@ -409,6 +425,36 @@
       <div class="dialog-actions">
         <button type="button" class="btn ghost" id="confirmCancelBtn">Cancel</button>
         <button type="submit" class="btn primary" id="confirmOkBtn"><i class="ph ph-check"></i><span id="confirmOkLabel">Continue</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- A file arriving on a plate that is not empty can mean two things, so it is asked rather
+       than assumed: another cutter beside the ones already there, or a fresh start. -->
+  <dialog class="dialog" id="importDialog">
+    <form method="dialog">
+      <h3><i class="ph ph-upload-simple"></i><span id="importTitle"></span></h3>
+      <div class="note" id="importBody"></div>
+      <div class="dialog-actions spread">
+        <button type="submit" class="btn ghost" id="importCancelBtn" value="cancel">Cancel</button>
+        <span class="spacer"></span>
+        <button type="submit" class="btn" id="importReplaceBtn" value="replace"><i class="ph ph-arrows-clockwise"></i><span id="importReplaceLabel">Replace the drawing</span></button>
+        <button type="submit" class="btn primary" id="importAddBtn" value="add"><i class="ph ph-plus"></i><span id="importAddLabel">Add to the plate</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Wall settings have no undo of their own, so putting a whole shape back to the defaults
+       says what it is about to change before it changes it. -->
+  <dialog class="dialog" id="resetDialog">
+    <form method="dialog">
+      <h3><i class="ph ph-arrow-counter-clockwise"></i><span id="resetTitle">Reset the settings?</span></h3>
+      <p class="note" id="resetBody"></p>
+      <div class="reset-table" id="resetTable" role="table" aria-label="What changes"></div>
+      <p class="note">The drawing, its size and the file name stay as they are. This cannot be undone.</p>
+      <div class="dialog-actions">
+        <button type="button" class="btn ghost" id="resetCancelBtn">Cancel</button>
+        <button type="submit" class="btn primary" id="resetOkBtn"><i class="ph ph-check"></i><span id="resetOkLabel">Reset</span></button>
       </div>
     </form>
   </dialog>
@@ -486,6 +532,29 @@
       </div>
     </form>
   </dialog>
+
+  <!-- Dragging a file into the window puts this over everything: the canvas lights up as the
+       place the file lands. It covers the whole window as well, so a file let go a little wide
+       of the canvas is still imported instead of being opened by the browser over the drawing.
+       It sits at body level because .canvas-wrap is a size container, which would catch a
+       fixed-position child. -->
+  <div class="drop-layer" id="dropLayer" hidden aria-hidden="true">
+    <div class="drop-zone" id="dropZone">
+      <i class="ph ph-upload-simple"></i>
+      <strong>Drop it here</strong>
+      <span>An SVG outline, an STL cutter or a .cutter project</span>
+    </div>
+  </div>
+
+  <!-- Reading a big file takes a few seconds and happens on the main thread, so the whole
+       window is covered while it does: something is happening, and nothing can be clicked
+       into the middle of it. -->
+  <div class="loader" id="loader" hidden role="status" aria-live="polite">
+    <div class="loader-box">
+      <span class="loader-spin" aria-hidden="true"></span>
+      <p id="loaderText">Working…</p>
+    </div>
+  </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 

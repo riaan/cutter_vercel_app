@@ -240,6 +240,22 @@ export function intersectPolygons(a, b) {
   return interI(a.map(toClip), b.map(toClip)).map(fromClip);
 }
 
+// `a` minus `b`, both given in mm. The result may be several contours with holes among them;
+// a canvas even-odd fill draws it as it stands.
+export function subtractPolygons(a, b) {
+  return diffI(a.map(toClip), b.map(toClip)).map(fromClip);
+}
+
+// Union of polygons with everything narrower than `gap` bridged over and then taken back off —
+// a morphological closing. Convex corners survive it exactly; concave ones tighter than the gap
+// are rounded off by it, which is the price of joining the pieces at all. Used by the STL
+// importer to put a cut region back together across the blades that cross it.
+export function closeGaps(polys, gap) {
+  const grown = offsetI(polys.map(toClip), gap);
+  const back = offsetI(grown, -gap);
+  return back.filter(p => CL().Clipper.Area(p) > 0).map(fromClip);
+}
+
 // Does polygon `a` sit entirely inside polygon `b`?
 export function isInside(a, b) {
   const rest = diffI([toClip(a)], [toClip(b)]);
@@ -288,11 +304,11 @@ export const DEFAULT_PARAMS = {
                      // matches the drawing when the cutter is used upside-down
 };
 
-// Builds the cutter. shape = { outer, inner } in mm, y pointing DOWN (screen space).
-// Model space is y-up, so by default (no mirror) the top view equals the drawing.
-// Requires loadManifold() to have completed.
-export function buildCutter(shape, params) {
-  if (!M) throw new Error('The 3D engine is still loading — one moment.');
+// One cutter as a Manifold solid, in model space. shape = { outer, inner } in mm, y pointing
+// DOWN (screen space); model space is y-up, so by default (no mirror) the top view equals the
+// drawing. Everything made along the way is pushed onto `trash`, which the caller empties —
+// WASM memory is not garbage collected. Returns the solid and the cut line it was built from.
+function cutterSolid(shape, params, trash) {
   const p = { ...DEFAULT_PARAMS, ...params };
   const outerPts = Array.isArray(shape) ? shape : shape.outer;
   const innerPts = Array.isArray(shape) ? null : shape.inner;
@@ -325,110 +341,200 @@ export function buildCutter(shape, params) {
   }
 
   const { Manifold, CrossSection } = M;
-  const trash = [];
   const keep = (o) => { trash.push(o); return o; };
   const H = p.height;
+  const xs = (pts) => keep(CrossSection.ofPolygons([pts.map(q => [q.x, q.y])], 'Positive'));
+  // rounded offsets can emit repeated vertices; simplify() removes them (0.001 mm)
+  const off = (cs, d) => keep(keep(cs.offset(d, 'Round', 2, SEGMENTS)).simplify(0.001));
+  const prism = (cs, z0, z1) => keep(keep(Manifold.extrude(cs, z1 - z0)).translate([0, 0, z0]));
+  const unionAll = (list) => list.reduce((a, b) => keep(a.add(b)));
+
+  const O = xs(outer);
+  // stepped outer body: each tier reaches OV into the tier below (it is narrower, so hidden)
+  const body = unionAll(tiers.map((t, i) => prism(off(O, t.w + FAT), i ? t.z0 - OV : 0, t.z1)));
+  if (body.isEmpty()) throw new Error('The shape is too small for these wall settings.');
+  let solid = keep(body.subtract(prism(O, -1, H + 1)));
+
+  if (inner) {
+    const I = xs(inner);
+    // stepped hole: wider going up, so each tier reaches OV up into the (wider) tier above
+    const hole = unionAll(tiers.map((t, i) => {
+      const cs = off(I, -(t.w - FAT));
+      return cs.isEmpty() ? null : prism(cs, i ? t.z0 : -1, i === tiers.length - 1 ? H + 1 : t.z1 + OV);
+    }).filter(Boolean));
+    const innerWall = hole ? keep(prism(I, 0, H).subtract(hole)) : prism(I, 0, H);
+    solid = keep(solid.add(innerWall));
+
+    const base = tiers.find(t => t.base);
+    if (base && p.bridgeCount > 0 && p.bridgeWidth > 0) {
+      // bars end 0.05 mm inside the base rings so they overlap the walls instead of touching them
+      const region = keep(off(O, base.w - 0.05).subtract(off(I, -(base.w - 0.05))));
+      const bars = barShapes(bounds(outer), bounds(inner), p, p.mirror ? 1 : -1).map(b => xs(b));
+      const barsCS = keep(unionAll(bars).intersect(region));
+      if (!barsCS.isEmpty()) solid = keep(solid.add(prism(barsCS, 0, base.z1)));
+    }
+  }
+  return { solid, outer };
+}
+
+// A Manifold solid as the triangle soup and the numbers the app shows.
+function meshOf(solid) {
+  const mesh = solid.getMesh();
+  const positions = new Float32Array(mesh.numTri * 9);
+  const vp = mesh.vertProperties, tv = mesh.triVerts, np = mesh.numProp;
+  for (let t = 0; t < mesh.numTri; t++) {
+    for (let c = 0; c < 3; c++) {
+      const v = tv[3 * t + c] * np;
+      positions[t * 9 + c * 3] = vp[v]; positions[t * 9 + c * 3 + 1] = vp[v + 1]; positions[t * 9 + c * 3 + 2] = vp[v + 2];
+    }
+  }
+  const bb = solid.boundingBox();
+  return { positions, triangles: mesh.numTri, bounds: boxOf(bb), volumeMm3: solid.volume() };
+}
+
+// A Manifold bounding box in the shape the rest of the app reads bounds in.
+function boxOf(bb) {
+  const b = { minX: bb.min[0], minY: bb.min[1], minZ: bb.min[2], maxX: bb.max[0], maxY: bb.max[1], maxZ: bb.max[2] };
+  b.width = b.maxX - b.minX; b.height = b.maxY - b.minY;
+  b.cx = (b.minX + b.maxX) / 2; b.cy = (b.minY + b.maxY) / 2;
+  return b;
+}
+
+const emptyTrash = (trash) => { for (const o of trash) { try { o.delete(); } catch { /* already gone */ } } };
+
+// Builds the cutter. shape = { outer, inner } in mm, y pointing DOWN (screen space).
+// Model space is y-up, so by default (no mirror) the top view equals the drawing.
+// Requires loadManifold() to have completed.
+export function buildCutter(shape, params) {
+  if (!M) throw new Error('The 3D engine is still loading — one moment.');
+  const trash = [];
   try {
-    const xs = (pts) => keep(CrossSection.ofPolygons([pts.map(q => [q.x, q.y])], 'Positive'));
-    // rounded offsets can emit repeated vertices; simplify() removes them (0.001 mm)
-    const off = (cs, d) => keep(keep(cs.offset(d, 'Round', 2, SEGMENTS)).simplify(0.001));
-    const prism = (cs, z0, z1) => keep(keep(Manifold.extrude(cs, z1 - z0)).translate([0, 0, z0]));
-    const unionAll = (list) => list.reduce((a, b) => keep(a.add(b)));
-
-    const O = xs(outer);
-    // stepped outer body: each tier reaches OV into the tier below (it is narrower, so hidden)
-    const body = unionAll(tiers.map((t, i) => prism(off(O, t.w + FAT), i ? t.z0 - OV : 0, t.z1)));
-    if (body.isEmpty()) throw new Error('The shape is too small for these wall settings.');
-    let solid = keep(body.subtract(prism(O, -1, H + 1)));
-
-    if (inner) {
-      const I = xs(inner);
-      // stepped hole: wider going up, so each tier reaches OV up into the (wider) tier above
-      const hole = unionAll(tiers.map((t, i) => {
-        const cs = off(I, -(t.w - FAT));
-        return cs.isEmpty() ? null : prism(cs, i ? t.z0 : -1, i === tiers.length - 1 ? H + 1 : t.z1 + OV);
-      }).filter(Boolean));
-      const innerWall = hole ? keep(prism(I, 0, H).subtract(hole)) : prism(I, 0, H);
-      solid = keep(solid.add(innerWall));
-
-      const base = tiers.find(t => t.base);
-      if (base && p.bridgeCount > 0 && p.bridgeWidth > 0) {
-        // bars end 0.05 mm inside the base rings so they overlap the walls instead of touching them
-        const region = keep(off(O, base.w - 0.05).subtract(off(I, -(base.w - 0.05))));
-        const bars = barShapes(bounds(outer), bounds(inner), p, p.mirror ? 1 : -1).map(b => xs(b));
-        const barsCS = keep(unionAll(bars).intersect(region));
-        if (!barsCS.isEmpty()) solid = keep(solid.add(prism(barsCS, 0, base.z1)));
-      }
-    }
-
-    const mesh = solid.getMesh();
-    const positions = new Float32Array(mesh.numTri * 9);
-    const vp = mesh.vertProperties, tv = mesh.triVerts, np = mesh.numProp;
-    for (let t = 0; t < mesh.numTri; t++) {
-      for (let c = 0; c < 3; c++) {
-        const v = tv[3 * t + c] * np;
-        positions[t * 9 + c * 3] = vp[v]; positions[t * 9 + c * 3 + 1] = vp[v + 1]; positions[t * 9 + c * 3 + 2] = vp[v + 2];
-      }
-    }
-    const bb = solid.boundingBox();
-    const outerB = { minX: bb.min[0], minY: bb.min[1], maxX: bb.max[0], maxY: bb.max[1] };
-    outerB.width = outerB.maxX - outerB.minX; outerB.height = outerB.maxY - outerB.minY;
-    outerB.cx = (outerB.minX + outerB.maxX) / 2; outerB.cy = (outerB.minY + outerB.maxY) / 2;
+    const { solid, outer } = cutterSolid(shape, params, trash);
+    const m = meshOf(solid);
     const shapeB = bounds(outer);
     return {
-      positions,
-      triangles: mesh.numTri,
-      bounds: { ...outerB, minZ: 0, maxZ: H },
+      ...m,
       piece: { width: shapeB.width, height: shapeB.height },
-      footprint: { width: outerB.width, height: outerB.height, height3d: H },
-      volumeMm3: solid.volume(),
+      footprint: { width: m.bounds.width, height: m.bounds.height, height3d: m.bounds.maxZ },
     };
   } finally {
-    for (const o of trash) { try { o.delete(); } catch { /* already gone */ } }
+    emptyTrash(trash);
   }
 }
 
-// Several cutters on one plate. Each shape is built on its own — they never touch, so the
-// triangle soups simply follow one another and the result is as watertight as its parts. The
-// shapes keep their places on the canvas, so the plate comes out arranged the way it is drawn.
-export function buildAll(parts) {
-  const built = [];
-  for (let i = 0; i < parts.length; i++) {
-    const { shape, params, label } = parts[i];
-    try {
-      built.push(buildCutter(shape, params));
-    } catch (e) {
-      // With one shape on the plate the message is about the only thing there is; with several
-      // it has to say which one, so it can be found in the shapes list.
-      throw new Error(parts.length > 1 ? `${label || `Shape ${i + 1}`}: ${e.message}` : e.message);
+// mm of slack on a footprint when deciding whether two cutters run into each other. Bases that
+// merely touch are as much one piece of plastic as bases that overlap.
+const MERGE_TOUCH = 0.01;
+
+// How wide a shape's base reaches out from its cut line — the same clamps buildCutter applies.
+function footWidthOf(params) {
+  const p = { ...DEFAULT_PARAMS, ...params };
+  return Math.max(Math.max(0.3, p.bladeWidth), p.baseWidth);
+}
+
+// Which shapes on a plate have to be built as one object. Two cutters whose bases run into each
+// other are one piece of plastic; laying their triangles side by side would leave two surfaces
+// crossing inside the print, which is the one thing a slicer cannot make sense of. Shapes that
+// merely sit near one another are left alone — a union costs time and gains nothing.
+// Returns a list of groups, each a list of indices into `parts`, in the order the shapes come.
+function overlapGroups(parts) {
+  if (parts.length < 2) return parts.map((_, i) => [i]);
+  const outers = parts.map(part => (Array.isArray(part.shape) ? part.shape : part.shape.outer));
+  const widths = parts.map(part => footWidthOf(part.params) + MERGE_TOUCH);
+  // The boxes are the cheap test and come first: on a plate where nothing is near anything,
+  // no outline is ever grown.
+  const boxes = outers.map((o, i) => {
+    if (!o || o.length < 3) return null;
+    const b = bounds(o);
+    return { minX: b.minX - widths[i], maxX: b.maxX + widths[i], minY: b.minY - widths[i], maxY: b.maxY + widths[i] };
+  });
+  const feet = new Array(parts.length).fill(undefined);
+  const footOf = (i) => {
+    if (feet[i] === undefined) {
+      try { feet[i] = offsetPolygon(outers[i], widths[i]); }
+      catch { feet[i] = null; }   // an outline Clipper cannot grow is the builder's problem
+    }
+    return feet[i];
+  };
+  const parent = parts.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const apart = (a, b) => a.maxX < b.minX || b.maxX < a.minX || a.maxY < b.minY || b.maxY < a.minY;
+  for (let a = 0; a < parts.length; a++) {
+    for (let b = a + 1; b < parts.length; b++) {
+      if (!boxes[a] || !boxes[b] || find(a) === find(b)) continue;
+      if (apart(boxes[a], boxes[b])) continue;
+      const fa = footOf(a), fb = footOf(b);
+      if (!fa || !fb) continue;
+      let hit = false;
+      try { hit = intersectPolygons([fa], [fb]).some(r => Math.abs(signedArea(r)) > 1e-4); }
+      catch { hit = false; }
+      if (hit) parent[find(a)] = find(b);
     }
   }
-  if (!built.length) throw new Error('Draw a closed shape first.');
-  if (built.length === 1) return { ...built[0], parts: built };
+  const groups = new Map();
+  for (let i = 0; i < parts.length; i++) {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(i);
+  }
+  return [...groups.values()];
+}
 
-  let n = 0;
-  for (const b of built) n += b.positions.length;
-  const positions = new Float32Array(n);
-  let at = 0;
-  for (const b of built) { positions.set(b.positions, at); at += b.positions.length; }
+// Several cutters on one plate. Each shape is built on its own; shapes that run into each other
+// are unioned into a single watertight solid, and the rest simply follow one another in the
+// triangle soup. The shapes keep their places on the canvas, so the plate comes out arranged
+// the way it is drawn.
+export function buildAll(parts) {
+  if (!M) throw new Error('The 3D engine is still loading — one moment.');
+  if (!parts.length) throw new Error('Draw a closed shape first.');
+  const trash = [];
+  try {
+    const built = parts.map((part, i) => {
+      try {
+        return cutterSolid(part.shape, part.params, trash);
+      } catch (e) {
+        // With one shape on the plate the message is about the only thing there is; with several
+        // it has to say which one, so it can be found in the shapes list.
+        throw new Error(parts.length > 1 ? `${part.label || `Shape ${i + 1}`}: ${e.message}` : e.message);
+      }
+    });
+    const groups = overlapGroups(parts);
+    const info = built.map((b, i) => {
+      const sb = bounds(b.outer);
+      return { label: parts[i].label || `Shape ${i + 1}`, bounds: boxOf(b.solid.boundingBox()),
+               piece: { width: sb.width, height: sb.height } };
+    });
+    const meshes = groups.map(g => {
+      let solid = built[g[0]].solid;
+      for (let k = 1; k < g.length; k++) { solid = solid.add(built[g[k]].solid); trash.push(solid); }
+      return meshOf(solid);
+    });
 
-  const acc = (key, f) => built.reduce((v, b) => f(v, b.bounds[key]), f === Math.min ? Infinity : -Infinity);
-  const bb = {
-    minX: acc('minX', Math.min), maxX: acc('maxX', Math.max),
-    minY: acc('minY', Math.min), maxY: acc('maxY', Math.max),
-    minZ: 0, maxZ: acc('maxZ', Math.max),
-  };
-  bb.width = bb.maxX - bb.minX; bb.height = bb.maxY - bb.minY;
-  bb.cx = (bb.minX + bb.maxX) / 2; bb.cy = (bb.minY + bb.maxY) / 2;
-  return {
-    positions,
-    parts: built,
-    triangles: built.reduce((t, b) => t + b.triangles, 0),
-    bounds: bb,
-    piece: { width: bb.width, height: bb.height },
-    footprint: { width: bb.width, height: bb.height, height3d: bb.maxZ },
-    volumeMm3: built.reduce((v, b) => v + b.volumeMm3, 0),
-  };
+    let n = 0;
+    for (const m of meshes) n += m.positions.length;
+    const positions = new Float32Array(n);
+    let at = 0;
+    for (const m of meshes) { positions.set(m.positions, at); at += m.positions.length; }
+
+    const bb = boxOf({
+      min: [Math.min(...meshes.map(m => m.bounds.minX)), Math.min(...meshes.map(m => m.bounds.minY)), 0],
+      max: [Math.max(...meshes.map(m => m.bounds.maxX)), Math.max(...meshes.map(m => m.bounds.maxY)),
+            Math.max(...meshes.map(m => m.bounds.maxZ))],
+    });
+    const pieceB = bounds(built.map(b => b.outer).flat());
+    return {
+      positions,
+      parts: info,          // one entry per shape on the plate — where it sits, and the piece it cuts
+      objects: groups.length, // separate solids in the result; fewer than shapes means some were joined
+      triangles: meshes.reduce((t, m) => t + m.triangles, 0),
+      bounds: bb,
+      piece: { width: pieceB.width, height: pieceB.height },
+      footprint: { width: bb.width, height: bb.height, height3d: bb.maxZ },
+      volumeMm3: meshes.reduce((v, m) => v + m.volumeMm3, 0),
+    };
+  } finally {
+    emptyTrash(trash);
+  }
 }
 
 // Bar rectangles (mm polygons, CCW) radiating from the inner shape's centre.

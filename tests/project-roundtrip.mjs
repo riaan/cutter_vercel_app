@@ -46,6 +46,12 @@ const cases = [
     { shape: { outer: at(circ(20), -40, 0), inner: at(circ(10), -40, 0) }, sym: { x: false, y: false }, params: { height: 12, bridgeCount: 3 } },
     { shape: { outer: at(star, 45, 5), inner: [] }, sym: { x: false, y: false }, params: { height: 25, bladeWidth: 0.7, ridge: false } },
   ]],
+  // Shapes that run into each other are one object in the STL, but the file keeps them apart —
+  // opening it has to give the two shapes back, not the merged lump.
+  ['overlapping pair, saved as two shapes', [
+    { shape: { outer: at(circ(20), -12, 0), inner: [] }, sym: { x: false, y: false }, params: {} },
+    { shape: { outer: at(circ(20), 12, 0), inner: [] }, sym: { x: false, y: false }, params: { height: 18 } },
+  ]],
   // A shape mirrored about its own centre, sitting away from the canvas origin.
   ['plate of two, one mirrored off-centre', [
     { shape: { outer: at(circ(18), -50, 0), inner: [] }, sym: { x: false, y: false }, params: {} },
@@ -65,6 +71,7 @@ for (const [name, layers] of cases) {
   const state = {
     layers: layers.map(l => ({ ...l, symOrigin: l.symOrigin || { x: 0, y: 0 }, bridgeAuto: false })),
     index: 0, active: 'outer', tool: 'move', smoothing: 0.4, lockAspect: true,
+    allowOverlap: name.startsWith('overlapping'),
     grid: { size: 5, snap: true }, name: 'cutter-test',
   };
   const bytes = P.packProject(state, { stl: G.toBinarySTL(buildPlate(state.layers), 'cutter-test') });
@@ -78,6 +85,7 @@ for (const [name, layers] of cases) {
   const stateKept = back.layers.length === layers.length
     && first.sym.x === want.sym.x && first.sym.y === want.sym.y
     && back.grid.size === 5 && back.grid.snap === true && back.name === 'cutter-test'
+    && back.allowOverlap === name.startsWith('overlapping')
     && back.layers.every((l, i) => l.params.height === (layers[i].params.height ?? G.DEFAULT_PARAMS.height))
     && back.layers.every((l, i) => l.symOrigin.x === (layers[i].symOrigin?.x ?? 0));
   const handlesKept = name !== 'curved outline, mirrored model'
@@ -87,6 +95,35 @@ for (const [name, layers] of cases) {
   if (!ok) failed++;
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}` + (ok ? ` (${layers.length} shape(s), ${a.length / 9} triangles, ${(bytes.length / 1024).toFixed(0)} kB file)`
     : `  mesh:${same} settings:${stateKept} handles:${handlesKept}`));
+}
+
+// The plate above, read back: two shapes in the file, one merged object out of the builder.
+{
+  const layers = [
+    { shape: { outer: at(circ(20), -12, 0), inner: [] }, sym: { x: false, y: false }, symOrigin: { x: 0, y: 0 }, params: {}, bridgeAuto: false },
+    { shape: { outer: at(circ(20), 12, 0), inner: [] }, sym: { x: false, y: false }, symOrigin: { x: 0, y: 0 }, params: {}, bridgeAuto: false },
+  ];
+  const bytes = P.packProject({ layers, index: 0, active: 'outer', tool: 'move', allowOverlap: true,
+    smoothing: 0.4, lockAspect: true, grid: { size: 10, snap: false }, name: 'overlap' });
+  const back = await P.unpackProject(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  const res = G.buildAll(back.layers.map(l => ({ shape: l.shape, params: l.params })));
+  const ok = back.layers.length === 2 && back.allowOverlap === true && res.parts.length === 2 && res.objects === 1;
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  overlapping shapes are saved apart and built as one (${back.layers.length} shapes, ${res.objects} object)`);
+}
+
+// A file written before the setting existed cannot say whether its shapes may overlap; it says
+// nothing, and app.js reads the answer off the drawing instead.
+{
+  const legacy = {
+    format: P.PROJECT_FORMAT, schema: 2, app: 'Cutter', name: 'no-setting',
+    shapes: [{ shape: { outer: circ(20), inner: [] }, sym: { x: false, y: false }, params: {} }],
+    active: 'outer', tool: 'move', smoothing: 0.4, lockAspect: true, grid: { size: 10, snap: false },
+  };
+  const back = P.deserializeProject(legacy);
+  const ok = back.allowOverlap === null;
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  a file that does not state the overlap setting reads back as "not stated"`);
 }
 
 // A file written before shapes were a list must still open, as a plate with one shape on it.

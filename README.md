@@ -8,13 +8,24 @@ no accounts — everything runs in the browser.
 
 - **Several shapes on one plate**: the list at the canvas' top left holds every shape you are
   making. **+** adds one, clicking a row picks the shape you want to work on, the trash button
-  takes one off. The shape you pick is the one you draw, move and resize; the others stay on the
-  canvas in grey and cannot be picked up by accident. Every shape has its own size, walls, support
+  takes one off. With the Move tool you can also just click the shape on the canvas: it lights up
+  as you pass over it and a click picks it up, so a plate is laid out with your eyes on the
+  drawing instead of on the list. The shape you pick is the one you draw, move and resize; the
+  others stay on the canvas in grey and cannot be picked up by accident. Every shape has its own size, walls, support
   step and connections — changing the height of one leaves the others exactly as they were — and
   the settings panel says whose settings it is showing. The 3D preview and the STL are always the
-  whole plate, so what you see is what comes off the printer. Shapes may not touch: while you drag
-  one it stops against its neighbour, and a stroke drawn on top of another shape is refused, so two
-  cutters never fuse into one piece.
+  whole plate, so what you see is what comes off the printer. By default shapes may not touch:
+  while you drag one it stops against its neighbour, and a stroke drawn on top of another shape is
+  refused, so two cutters never fuse into one piece by accident.
+- **Letting shapes overlap**: *Allow overlap*, at the foot of the shapes list once there are two
+  shapes on the plate, lets them run into each other instead of stopping against their neighbours — two hearts sharing a lobe, a letter
+  leaning on the next. Where they do overlap they come out as **one merged object**, in the 3D
+  preview and in the STL, so the printer and the slicer see a single piece rather than two
+  surfaces crossing inside it. Shapes that stay apart are still separate objects in the same file.
+  Importing an SVG or an STL whose shapes already run into each other switches the setting on by
+  itself — nothing is moved, because the layout belongs to the file. The project file always keeps
+  the shapes apart, one by one, so a plate that prints as one lump still opens as the separate
+  shapes you drew.
 - **Draw** the shape freehand; the outline closes, smooths and repairs itself
   (self-intersections are resolved automatically, tiny slivers dropped).
 - **Tool explanation**: the (i) beside the three tool buttons explains the tool in hand — hover it
@@ -45,11 +56,28 @@ no accounts — everything runs in the browser.
   still; hold Alt (Option on a Mac) and it holds the middle of the shape instead, so every side
   moves and the shape stays where it is. The bar at the canvas' top right shows where the middle
   of the shape sits, which you can type over.
+  **Clicking another shape picks that one up** — it becomes the shape you are working on, and the
+  same press can drag it straight to where you want it. Shapes you are not holding light up as
+  the pointer passes over them, so you can see what a click would pick up. A click on the empty
+  canvas (or Escape) puts the shape down: the box, its handles and the position bar go away and
+  nothing moves by accident. It stays the shape the settings panel is showing and the one the
+  other tools draw on — the Move tool has simply let go of it.
 - **Import**: an SVG with paths or basic shapes, or an STL of a cutter. For an SVG a dialog asks
   for the size of the whole drawing (prefilled from the SVG's physical units, or 80 mm wide); each
   separate outline becomes a shape of its own, laid out the way the file lays them out, and a hole
   inside one becomes that shape's inner wall. An STL is read back as whole cutters — see
   *Opening an STL* below.
+- **Dropping a file in**: drag an SVG, an STL or a `.cutter` project from your computer onto the
+  window. The canvas lights up as the place it lands; let go anywhere on the page and it is
+  imported. (Anywhere, so that a file let go just beside the canvas is still imported instead of
+  being opened by the browser over the top of your drawing.)
+- **Add, or start over**: with something on the canvas already, a file you import is not assumed
+  to replace it. You are asked: *add* puts its shapes on the plate beside the ones there — several
+  at once if the file holds several, keeping the arrangement they came in and moved clear of what
+  is already drawn — or *replace* starts over with the file. Adding is one undo step; replacing
+  clears the undo history, as opening a project always has. On an empty canvas nothing is asked.
+- **While it is working**: reading a big file and building the solid can take a few seconds, and
+  the app says so with a message over the window rather than appearing to have done nothing.
 - **Starter shapes**: twenty-two outlines, picked from a grid of previews so you can see each
   one before you insert it. Round ones (circle, oval, egg, teardrop, leaf, pebble), arches and
   bands (half circle, arch, rounded bar, rainbow, moon, shield), straight-sided ones (rounded
@@ -97,6 +125,16 @@ no accounts — everything runs in the browser.
 - **Exact size**: width/height inputs in mm with a proportion lock, for the shape you are editing.
 - **Cutter walls**: cutter height, blade thickness, base (flange) width/thickness,
   optional support step — with a live cross-section diagram.
+- **Back to the standard settings**: every setting that is not on the app's default carries a
+  small undo arrow beside its label — one press puts that one back. When any of them differ, a
+  row at the top of the settings panel says how many, and *Reset all* puts the whole shape back
+  at once; it first shows you a list of what changes, from what to what, so you can say no. This
+  is mostly for a cutter opened from an STL, where every number was measured off the model and
+  can be a long way from where a shape you draw starts. It only ever touches the shape you are
+  on, never the drawing or its size. The settings panel shows one shape at a time, so the shapes
+  list on the canvas carries the same arrow beside the name of every shape that is off the
+  standard settings — including the ones you are not looking at. It is a marker, not a button:
+  tapping it takes you to that shape, where the settings are.
 - **Live 3D preview** (drag to orbit, pinch/scroll to zoom), footprint size, volume and
   an estimated PLA weight. *Top* matches the drawing; *Back* looks at the cutting edge.
 - **Cut piece preview**: *Cut piece* (next to the 3D view buttons) opens a popup with the pieces
@@ -111,22 +149,34 @@ no accounts — everything runs in the browser.
   view of the model equals the drawing; turn on *Mirror the model* when the cut piece must
   match the drawing exactly (a cutter is used upside-down, so letters would otherwise come out
   mirrored). Mirroring turns the whole plate over, so it is one setting for all the shapes.
+  Shapes that overlap are written as one merged solid; the rest follow one another in the file.
 - **Save / open a project**: *Save project* writes a `.cutter` file holding every shape and all
-  its settings; open it later and you get exactly the same plate back. It is a plain zip —
+  its settings — shapes that overlap included, kept separate — so opening it later gives you
+  exactly the same plate back, shape by shape. It is a plain zip —
   rename it to `.zip` and you will find `project.json`, the `model.stl` as downloaded, and a
   picture of the drawing and of the 3D view. Only `project.json` is read back; the mesh is
   rebuilt from it.
 - **Opening an STL**: an STL of a cutter — one of yours from before project files existed, or one
-  made elsewhere — can be opened with *Open project* or with *Import*, and comes back as a drawing
-  with its settings. A file holding several cutters comes back as several shapes, each with the
+  made elsewhere — can be opened with *Open project*, with *Import*, or by dropping it on the
+  window, and comes back as a drawing with its settings. A file holding several cutters comes back as several shapes, each with the
   settings measured off it. A cutter is a stack of straight-walled tiers, so a horizontal cut
   through the model hands the outline straight back: the cut line is read halfway up the blade,
   the heights come from the tiers, the wall widths from how far each tier stands out from the cut
-  line, and the connection bars from what crosses the channel at base level. You get the same
-  cutter, and can now change it. Two things an STL cannot hold: curve handles (the outline comes
-  back as the points it was flattened to) and symmetry (the whole outline comes back, not a half
-  to mirror). Anything that is not a cutter — a solid with no blade — gives its outline at the
-  top and leaves the wall settings alone, and says so.
+  line, and the connection bars from what crosses the channel at base level — measured across the
+  bar's own sides, so a wide connection in a narrow channel comes back as the connection and not
+  the channel, and read past a base flange that overhangs its cut line, which would otherwise weld
+  every connection into one. You get the same
+  cutter, and can now change it. Shapes that overlap are printed as one object, and they still come
+  back one by one — with their own heights, walls and holes — even where their blades run straight
+  through each other. That is read, not guessed: a wall stands on its cut line and grows away from
+  it, so the cut line is in the same place at every height of the cutter while the other side of
+  the wall moves, and that says which shape each wall belongs to. Two circles half over each other
+  come back as two circles. Two things an STL cannot hold: curve handles (the outline comes back as
+  the points it was flattened to) and symmetry (the whole outline comes back, not a half to
+  mirror). Anything that is not a cutter — a solid with no blade — gives its outline at the top and
+  leaves the wall settings alone, and says so. Because the settings come off the model rather than
+  from the app's defaults, the settings panel marks the ones that differ and offers to put them
+  back — see *Back to the standard settings* above.
 
 ## Run locally
 

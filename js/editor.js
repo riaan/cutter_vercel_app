@@ -179,6 +179,17 @@ function roundAmountOf(pts) {
   return Math.min(1, Math.round((sum / k) / ROUND_BULGE * 20) / 20);
 }
 
+// Is a point inside a closed contour? Used both for the shape being moved and for picking
+// another one up off the canvas.
+function inPoly(pts, m) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const pi = pts[i], pj = pts[j];
+    if ((pi.y > m.y) !== (pj.y > m.y) && m.x < (pj.x - pi.x) * (m.y - pi.y) / (pj.y - pi.y) + pi.x) inside = !inside;
+  }
+  return inside;
+}
+
 export class ShapeEditor {
   constructor(canvas, { onChange = () => {}, onGuides = () => {}, onSelect = () => {}, onMenu = () => {}, onView = () => {},
                onBlock = () => {}, rings = () => null, colors = {} } = {}) {
@@ -200,6 +211,10 @@ export class ShapeEditor {
       // the shapes you are not editing: grey, and faint enough to read as background
       otherLine: 'rgba(147,151,171,0.6)', otherFill: 'rgba(147,151,171,0.07)',
       otherBase: 'rgba(147,151,171,0.09)', otherBlade: 'rgba(147,151,171,0.3)',
+      // the one under the pointer: a step from that grey towards the shape you are editing, so
+      // you can see what a click would pick up without it already looking picked up
+      hotLine: 'rgba(145,132,217,0.7)', hotFill: 'rgba(145,132,217,0.08)',
+      hotBase: 'rgba(147,151,171,0.14)', hotBlade: 'rgba(145,132,217,0.4)',
 
     }, colors);
 
@@ -207,10 +222,20 @@ export class ShapeEditor {
     // are accessors onto that layer, so everything below reads as if there were only ever one.
     this.layers = [newLayer()];
     this.index = 0;
+    // Whether the Move tool is holding the shape being edited: the box, its handles and the
+    // position bar are on it and the arrow keys nudge it. A click on empty canvas puts it down;
+    // a click on a shape picks that one up. Anything that changes which shape is being edited
+    // hands the new one over held, so the tool is never left grasping at nothing.
+    this.picked = true;
+    this.hot = -1;   // the shape under the pointer, lit up as what a click would pick up
     this.active = 'outer';
     this.tool = 'draw';
     this.smoothing = 0.4;
     this.lockAspect = true;
+    // Off, two cutters on one plate have to stay apart — the guard below stops a drag against
+    // its neighbour. On, they may run into each other; where they do, the builder makes one
+    // merged object out of them, because that is what comes off the printer.
+    this.allowOverlap = false;
     this.grid = { size: 10, snap: false };
     this.guides = [];
     // size = mm across the shorter canvas edge at 100 %; zoom multiplies it; pan is the mm
@@ -310,12 +335,37 @@ export class ShapeEditor {
     this._dropRound();
     this.stroke = null; this.drag = null; this.gesture = null; this.viewGesture = null;
     this.index = i;
+    this.picked = true;
     // The inner wall of the shape you have just come to may not exist; fall back rather than
     // leaving the tabs pointing at nothing.
     if (this.active === 'inner' && this.shape.inner.length < 3) this.active = 'outer';
     this._select(-1);
     this.dirty = true;
     this._changed({ selectionOnly: true });
+  }
+
+  // Pick a shape up off the canvas: it becomes the shape being edited and the Move tool takes
+  // hold of it. Clicking a shape is the other way into the shapes list's job — with your eyes
+  // on the drawing, where the shape you mean is the one you can see.
+  pickShape(i) {
+    if (i < 0 || i >= this.layers.length) return false;
+    if (i === this.index && this.picked) return false;
+    this.picked = true;
+    this._setHot(-1);
+    if (i !== this.index) this.setLayer(i);   // reports the change itself
+    else this._changed({ selectionOnly: true });
+    return true;
+  }
+
+  // Put the shape down: nothing is held, so the box, its handles and the position bar go. The
+  // shape itself stays the one being edited — it is the one the settings panel is showing, and
+  // the other tools still draw on it — it is only the Move tool that has let go.
+  dropShape() {
+    if (this.tool !== 'move' || !this.picked) return false;   // only this tool ever holds a shape
+    this.picked = false;
+    this._setHot(-1);
+    this._changed({ selectionOnly: true });
+    return true;
   }
 
   // A new shape starts empty but with the wall settings of the one you were on: the height and
@@ -326,6 +376,7 @@ export class ShapeEditor {
     const l = newLayer(this.params);
     this.layers.push(l);
     this.index = this.layers.length - 1;
+    this.picked = true;
     this.active = 'outer';
     this._select(-1);
     this._changed();
@@ -339,6 +390,7 @@ export class ShapeEditor {
     this.layers.splice(i, 1);
     if (this.index > i) this.index--;
     if (this.index >= this.layers.length) this.index = this.layers.length - 1;
+    this.picked = true;
     this.active = 'outer';
     this._select(-1);
     this._autoFit();
@@ -354,7 +406,9 @@ export class ShapeEditor {
     })).filter(p => p.shape.outer.length >= 3);
   }
 
-  setTool(tool) { this.tool = tool; this.stroke = null; this.drag = null; this._select(-1); this._setCursor(this._defaultCursor()); this.requestRender(); }
+  // Reaching for the Move tool means moving the shape you are on, so it comes back held
+  // however the canvas was left.
+  setTool(tool) { this.tool = tool; this.stroke = null; this.drag = null; this.picked = true; this._setHot(-1); this._select(-1); this._setCursor(this._defaultCursor()); this.requestRender(); }
   setActive(which) { this._dropRound(); this.active = which; this.stroke = null; this.drag = null; this._select(-1); this.requestRender(); }
 
   // ----- view (zoom / pan) -----
@@ -472,11 +526,90 @@ export class ShapeEditor {
       return l;
     });
     this.index = 0;
+    this.picked = true;
     this.active = 'outer';
     this._select(-1);
     this._keepOutCache = { key: null, polys: [] };
     this._autoFit();
     this._changed();
+  }
+
+  // Put more shapes on the plate without touching the ones already on it — a file dropped onto
+  // a drawing that is already there. The entries are the ones setState() takes (a file's layers,
+  // seeds and all); a plain { outer, inner } is taken as a shape with no settings of its own,
+  // and then the wall settings of the shape you are on are what it starts with.
+  // The arrivals keep their own arrangement and are moved clear of the plate as one group: a
+  // sheet of four charms is added as that sheet, not as four shapes shuffled into the gaps.
+  addLayers(list, { record = true, params = null } = {}) {
+    const items = (list || []).filter(it => ((it.shape || it).outer || []).length);
+    if (!items.length) return 0;
+    this._dropRound();
+    if (record) this._record();
+    const base = params || { ...this.params };
+    const first = this.layers.length;
+    for (const it of items) this.layers.push(this._layerFrom(it, base));
+    this._placeGroup(first);
+    this.index = first;
+    this.picked = true;
+    this.active = 'outer';
+    this._select(-1);
+    this._keepOutCache = { key: null, polys: [] };
+    this._autoFit();
+    this._changed();
+    return items.length;
+  }
+
+  // One layer out of whatever a file hands over. Nested ({ shape, sym, params, … }) is the form
+  // a project and an STL come in; flat ({ outer, inner }) is what an SVG gives.
+  _layerFrom(it, base) {
+    const src = it.shape || it;
+    const l = newLayer(it.params || base);
+    l.shape = { outer: copy(src.outer || []), inner: copy(src.inner || []) };
+    if (it.sym) l.sym = { x: !!it.sym.x, y: !!it.sym.y };
+    const o = it.symOrigin;
+    if (o) l.symOrigin = { x: isFinite(o.x) ? o.x : 0, y: isFinite(o.y) ? o.y : 0 };
+    // A symmetric half is closed by its mirror lines, so it can never be an open outline.
+    const symOn = l.sym.x || l.sym.y;
+    l.open = { outer: !!it.open?.outer && !symOn, inner: !!it.open?.inner && !symOn };
+    if (it.bridgeAuto !== undefined) l.bridgeAuto = !!it.bridgeAuto;
+    return l;
+  }
+
+  // The box round a run of layers, with the widest base among them: what has to be kept clear.
+  _groupBox(from, to) {
+    let box = null, pad = 0;
+    for (let i = from; i < to; i++) {
+      const o = this._displayOf(this.layers[i]).outer;
+      if (o.length < 3) continue;
+      const b = bounds(o);
+      box = box ? { minX: Math.min(box.minX, b.minX), maxX: Math.max(box.maxX, b.maxX),
+                    minY: Math.min(box.minY, b.minY), maxY: Math.max(box.maxY, b.maxY) } : b;
+      pad = Math.max(pad, this._baseWidthOf(this.layers[i]));
+    }
+    return box ? { ...box, pad } : null;
+  }
+
+  // Move the shapes added from `first` on clear of the ones already there, keeping the
+  // arrangement they arrived in. Only when they would land on top of something: a file whose
+  // shapes sit somewhere else entirely keeps the place it chose.
+  _placeGroup(first) {
+    if (first === 0) return;
+    const old = this._groupBox(0, first), added = this._groupBox(first, this.layers.length);
+    if (!old || !added) return;
+    const gap = old.pad + added.pad + SHAPE_GAP;
+    if (added.minX - gap > old.maxX || added.maxX + gap < old.minX
+        || added.minY - gap > old.maxY || added.maxY + gap < old.minY) return;
+    const dx = old.maxX + gap - added.minX;
+    const dy = (old.minY + old.maxY) / 2 - (added.minY + added.maxY) / 2;
+    for (let i = first; i < this.layers.length; i++) this._shiftLayer(this.layers[i], dx, dy);
+  }
+
+  _shiftLayer(l, dx, dy) {
+    if (!dx && !dy) return;
+    const f = p => ({ x: p.x + dx, y: p.y + dy });
+    l.shape = { outer: mapPts(l.shape.outer, f), inner: mapPts(l.shape.inner, f) };
+    l.symOrigin = f(l.symOrigin);
+    l.rev++; l._disp = null;
   }
 
   // Replace the active contour only.
@@ -507,6 +640,7 @@ export class ShapeEditor {
       tool: this.tool,
       smoothing: this.smoothing,
       lockAspect: this.lockAspect,
+      allowOverlap: this.allowOverlap,
       grid: { ...this.grid },
     };
   }
@@ -530,10 +664,14 @@ export class ShapeEditor {
       return layer;
     });
     this.index = Math.min(Math.max(0, Math.round(st.index) || 0), this.layers.length - 1);
+    this.picked = true;
     this.active = st.active === 'inner' && this.shape.inner.length >= 3 ? 'inner' : 'outer';
     this.tool = ['draw', 'points', 'move'].includes(st.tool) ? st.tool : 'move';
     if (typeof st.smoothing === 'number') this.smoothing = st.smoothing;
     if (typeof st.lockAspect === 'boolean') this.lockAspect = st.lockAspect;
+    // A plate whose shapes overlap can only be opened with the guard down; app.js works out
+    // what a file that does not say means before it gets here.
+    if (typeof st.allowOverlap === 'boolean') this.allowOverlap = st.allowOverlap;
     if (st.grid) this.grid = { size: Math.max(0.5, st.grid.size || 10), snap: !!st.grid.snap };
     this.undoStack.length = 0; this.redoStack.length = 0;
     this.stroke = null; this.drag = null; this.gesture = null; this.viewGesture = null;
@@ -1023,6 +1161,7 @@ export class ShapeEditor {
       return out;
     });
     this.index = Math.min(Math.max(0, snap.index), this.layers.length - 1);
+    this.picked = true;
     this.active = snap.active === 'inner' && this.shape.inner.length >= 3 ? 'inner' : 'outer';
   }
 
@@ -1140,6 +1279,7 @@ export class ShapeEditor {
   // Would this outline (canvas mm) run into another shape? Overlap either way round counts, so
   // a shape cannot be dropped inside another one's hole either.
   _blocked(outer) {
+    if (this.allowOverlap) return false;   // shapes are allowed to run into each other
     if (!outer || outer.length < 3 || this.layers.length < 2) return false;
     const keep = this._keepOut();
     if (!keep.length) return false;
@@ -1149,9 +1289,10 @@ export class ShapeEditor {
     return false;
   }
 
-  // Which shapes are touching or sitting on top of another one. Nothing you draw can get into
-  // that state, but a file decides for itself where its shapes go, so an import has to be
-  // looked over before it is called a plate.
+  // Which shapes are touching or sitting on top of another one. With the guard up nothing you
+  // draw can get into that state, but a file decides for itself where its shapes go — so an
+  // import has to be looked over before it is called a plate, and that is also what tells the
+  // app the file needs overlapping shapes allowed.
   clashingLayers() {
     const drawn = this.layers.map((l, i) => ({ i, outer: this._displayOf(l).outer, w: this._baseWidthOf(l) }))
       .filter(d => d.outer.length >= 3);
@@ -1206,7 +1347,7 @@ export class ShapeEditor {
 
   // Make a change to the active layer and take it back whole if it would run into another shape.
   _guard(fn, message) {
-    if (this.layers.length < 2 || this.active === 'inner') { fn(); return true; }
+    if (this.allowOverlap || this.layers.length < 2 || this.active === 'inner') { fn(); return true; }
     const before = copyShape(this.shape), origin = { ...this.symOrigin };
     fn();
     if (this._allowed()) return true;
@@ -1282,7 +1423,7 @@ export class ShapeEditor {
     c.addEventListener('pointermove', (e) => this._move(e));
     c.addEventListener('pointerup', (e) => this._up(e));
     c.addEventListener('pointercancel', (e) => this._up(e));
-    c.addEventListener('pointerleave', () => { if (!this.drag && !this.stroke) this._setCursor(this._defaultCursor()); });
+    c.addEventListener('pointerleave', () => { this._setHot(-1); if (!this.drag && !this.stroke) this._setCursor(this._defaultCursor()); });
     c.addEventListener('wheel', (e) => {
       // Zoom towards the cursor. preventDefault stops the page scrolling under the canvas.
       e.preventDefault();
@@ -1357,6 +1498,8 @@ export class ShapeEditor {
   }
 
   _bboxHandles() {
+    // Nothing held: no box, no handles, and nothing for a drag to catch hold of.
+    if (!this.picked) return null;
     const b = this._editBounds();
     if (!b) return null;
     const tl = this.toPx({ x: b.minX, y: b.minY }), br = this.toPx({ x: b.maxX, y: b.maxY });
@@ -1424,12 +1567,20 @@ export class ShapeEditor {
   }
 
   _insideShape(mm) {
-    const pts = this._display()[this.active]; let inside = false;
-    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-      const pi = pts[i], pj = pts[j];
-      if ((pi.y > mm.y) !== (pj.y > mm.y) && mm.x < (pj.x - pi.x) * (mm.y - pi.y) / (pj.y - pi.y) + pi.x) inside = !inside;
+    return inPoly(this._display()[this.active], mm);
+  }
+
+  // Which shape is under the pointer, by its outline: the one being edited first — it is drawn
+  // on top of the others — then the rest, topmost first. An outline still being placed is not a
+  // shape yet and cannot be picked up.
+  _layerAt(mm) {
+    const order = [this.index];
+    for (let i = this.layers.length - 1; i >= 0; i--) if (i !== this.index) order.push(i);
+    for (const i of order) {
+      const outer = this._displayOf(this.layers[i]).outer;
+      if (outer.length >= 3 && inPoly(outer, mm)) return i;
     }
-    return inside;
+    return -1;
   }
 
   _affected() { return this.active === 'outer' ? ['outer', 'inner'] : ['inner']; }
@@ -1477,14 +1628,34 @@ export class ShapeEditor {
       return { kind: 'none', cursor: 'default' };
     }
     const hb = this._bboxHandles();
-    if (!hb) return { kind: 'none', cursor: 'default' };
     const near = (h) => h && (h.x - px.x) ** 2 + (h.y - px.y) ** 2 <= HIT_R * HIT_R;
-    if (near(hb.rot)) return { kind: 'rotate', hb, cursor: ROTATE_CURSOR };
-    const h = hb.handles.find(near);
-    if (h) return { kind: 'scale', h, hb, cursor: h.cursor };
+    if (hb) {
+      if (near(hb.rot)) return { kind: 'rotate', hb, cursor: ROTATE_CURSOR };
+      const h = hb.handles.find(near);
+      if (h) return { kind: 'scale', h, hb, cursor: h.cursor };
+    }
     const mm = this.toMm(px);
-    if (this._insideShape(mm)) return { kind: 'move', hb, cursor: 'move' };
+    if (hb && this._insideShape(mm)) return { kind: 'move', hb, cursor: 'move' };
+    // Any other shape under the pointer is what a click picks up. The shape already in hand
+    // counts as one too — you can be over it without being over the wall you are moving (its
+    // inner one) — and picking it up again does nothing, which is better than letting go of it.
+    const i = this._layerAt(mm);
+    if (i >= 0) return { kind: 'pick', layer: i, cursor: i === this.index && this.picked ? 'default' : 'pointer' };
     return { kind: 'none', cursor: 'default' };
+  }
+
+  // Plain hover: the cursor, and which shape is lit up as the one a click would pick up.
+  _hoverAt(px) {
+    const h = this._hover(px);
+    this._setCursor(h.cursor);
+    this._setHot(h.kind === 'pick' && h.layer !== this.index ? h.layer : -1);
+    return h;
+  }
+
+  _setHot(i) {
+    if (this.hot === i) return;
+    this.hot = i;
+    this.dirty = true;
   }
 
   // ----- pointer handling -----
@@ -1495,6 +1666,7 @@ export class ShapeEditor {
     const px = this._eventPos(e);
     this.pointers.set(e.pointerId, px);
     this._cancelPress();
+    this._setHot(-1);   // the pointer is on its way down; nothing is merely being looked at
 
     // In pan mode two fingers pinch the view — on a phone there is no scroll wheel.
     if (this.pointers.size === 2 && this.panMode) {
@@ -1507,7 +1679,9 @@ export class ShapeEditor {
       };
       return;
     }
-    if (this.pointers.size === 2 && !this.panMode && this.points.length >= 3 && !this.symOn) {
+    // Nothing in hand, nothing to pinch: with the shape put down the two-finger gesture has no
+    // more business reshaping it than the handles have being on screen.
+    if (this.pointers.size === 2 && !this.panMode && this.picked && this.points.length >= 3 && !this.symOn) {
       this.stroke = null; this.drag = null;
       const [a, b] = [...this.pointers.values()];
       this.gesture = { start: this._startState(), d0: Math.hypot(b.x - a.x, b.y - a.y),
@@ -1610,7 +1784,18 @@ export class ShapeEditor {
       if (hit.kind === 'rotate') { this._record(); this.drag = { kind: 'rotate', start: this._startState(), c: hit.hb.b, a0: Math.atan2(px.y - hit.hb.center.y, px.x - hit.hb.center.x) }; this._setCursor(hit.cursor); return; }
       if (hit.kind === 'scale') { this._record(); this.drag = { kind: 'scale', h: hit.h, start: this._startState(), b: hit.hb.b, p0: mm }; this._setCursor(hit.cursor); return; }
       if (hit.kind === 'move') {
-        this._record(); this.drag = { kind: 'move', start: this._startState(), p0: mm, b0: bounds(this._display()[this.active]) }; this._setCursor('move');
+        this.drag = { kind: 'move', start: this._startState(), p0: mm, b0: bounds(this._display()[this.active]) }; this._setCursor('move');
+      } else if (hit.kind === 'pick') {
+        // A press on another shape picks it up, and the same press goes on to move it: laying
+        // out a plate is then one gesture per shape, not a click and then a drag. Only while
+        // the outer wall is the one being edited — that is the outline just pressed on.
+        const picked = this.pickShape(hit.layer);
+        if (picked && this.active === 'outer' && this._display().outer.length >= 3) {
+          this.drag = { kind: 'move', start: this._startState(), p0: mm, b0: bounds(this._display().outer) }; this._setCursor('move');
+        }
+      } else if (hit.kind === 'none') {
+        // Empty canvas: the shape is put down. Nothing is held until a shape is clicked again.
+        if (this.dropShape()) this._setCursor('default');
       }
     }
     this.dirty = true;
@@ -1627,7 +1812,7 @@ export class ShapeEditor {
     const px = this._eventPos(e);
     if (!this.pointers.has(e.pointerId)) {
       // plain hover: pick a cursor
-      if (!this.drag && !this.stroke) this._setCursor(this._hover(px).cursor);
+      if (!this.drag && !this.stroke) this._hoverAt(px);
       return;
     }
     e.preventDefault();
@@ -1734,6 +1919,10 @@ export class ShapeEditor {
       const adj = this._snapBox({ minX: b.minX + dx, maxX: b.maxX + dx, cx: b.cx + dx, minY: b.minY + dy, maxY: b.maxY + dy, cy: b.cy + dy });
       if (lock !== 'x') dx += adj.dx;   // the snap may not break the lock
       if (lock !== 'y') dy += adj.dy;
+      // The undo step is taken the moment the shape actually travels, not when the button goes
+      // down: a press is also how a shape is picked up, and picking one up changes nothing.
+      // The drawing is still untouched here, so the snapshot is of where the drag started.
+      if ((dx || dy) && !d.rec) { d.rec = true; this._record(); }
       this._applyTransform(d.start, p => ({ x: p.x + dx, y: p.y + dy })); this._changed();
     } else if (d.kind === 'rotate') {
       const c = this.toPx({ x: d.c.cx, y: d.c.cy });
@@ -1810,13 +1999,16 @@ export class ShapeEditor {
         if (!d.moved && d.menuIndex >= 0) this._openMenu(d.menuIndex, d.ev);
         this.dirty = true; return;
       }
-      if (d.kind === 'guide') { this._setCursor(this._hover(px).cursor); this.dirty = true; return; }
+      if (d.kind === 'guide') { this._hoverAt(px); this.dirty = true; return; }
       if (d.kind === 'vertex' && !d.moved) {
         this.undoStack.pop();
         // A press on the first point that never became a drag is the click that closes the outline.
-        if (d.closes) { this.closeContour(); this._setCursor(this._hover(px).cursor); return; }
+        if (d.closes) { this.closeContour(); this._hoverAt(px); return; }
       }
-      this._setCursor(this._hover(px).cursor);
+      // A press that never moved the shape: it picked it up and nothing else, so there is
+      // nothing to fit, to build or to report.
+      if (d.kind === 'move' && !d.rec) { this._hoverAt(px); this.dirty = true; return; }
+      this._hoverAt(px);
       if (d.kind !== 'vertex' && d.kind !== 'handle' && d.kind !== 'pen') this._autoFit();
       this._changed();
     }
@@ -1850,7 +2042,7 @@ export class ShapeEditor {
 
     // The shapes you are not editing stay on the canvas — you are laying out a plate, not one
     // cutter — but greyed back, because only one of them can be picked up.
-    for (let i = 0; i < this.layers.length; i++) if (i !== this.index) this._renderOther(this.layers[i]);
+    for (let i = 0; i < this.layers.length; i++) if (i !== this.index) this._renderOther(this.layers[i], i === this.hot);
 
     const disp = this._display();
     const rings = disp.outer.length >= 3 ? this._ringsFor(this.layer) : null;
@@ -1943,13 +2135,17 @@ export class ShapeEditor {
   // A layer that is not being edited: the same picture in grey, faint enough to read as
   // background, with its base band left in so you can see how close it is to the one you
   // are moving — which is what decides whether the move is allowed at all.
-  _renderOther(layer) {
+  _renderOther(layer, hot = false) {
     const disp = this._displayOf(layer);
     const ctx = this.ctx, C = this.colors;
+    // Under the pointer it comes a step forward: this is the shape a click would pick up, and
+    // seeing which one that is before pressing is the whole point of the lift.
+    const line = hot ? C.hotLine : C.otherLine, fill = hot ? C.hotFill : C.otherFill;
+    const baseFill = hot ? C.hotBase : C.otherBase, bladeFill = hot ? C.hotBlade : C.otherBlade;
     // An outline someone started and has not closed is still theirs: it stays on the canvas,
     // greyed back like the rest of the shape, instead of vanishing when you step away from it.
     for (const k of ['outer', 'inner']) {
-      if (layer.open[k] && layer.shape[k].length >= 2) this._polyline(flatten(layer.shape[k], false), C.otherLine, 1);
+      if (layer.open[k] && layer.shape[k].length >= 2) this._polyline(flatten(layer.shape[k], false), line, 1);
     }
     if (disp.outer.length < 3) return;
     const rings = this._ringsFor(layer);
@@ -1960,20 +2156,20 @@ export class ShapeEditor {
       ctx.fillStyle = fill; ctx.fill('evenodd');
     };
     ctx.beginPath(); this._path(disp.outer); if (hasInner) this._path(disp.inner);
-    ctx.fillStyle = C.otherFill; ctx.fill('evenodd');
+    ctx.fillStyle = fill; ctx.fill('evenodd');
     if (rings) {
-      band(rings.base, disp.outer, C.otherBase);
-      band(rings.blade, disp.outer, C.otherBlade);
+      band(rings.base, disp.outer, baseFill);
+      band(rings.blade, disp.outer, bladeFill);
       if (hasInner) {
-        band(disp.inner, rings.innerBase, C.otherBase);
-        band(disp.inner, rings.innerBlade, C.otherBlade);
+        band(disp.inner, rings.innerBase, baseFill);
+        band(disp.inner, rings.innerBlade, bladeFill);
       }
       if (rings.bridges && rings.bridges.length) {
         ctx.beginPath(); for (const g of rings.bridges) this._path(g);
-        ctx.fillStyle = C.otherBase; ctx.fill();
+        ctx.fillStyle = baseFill; ctx.fill();
       }
     }
-    ctx.lineWidth = 1; ctx.strokeStyle = C.otherLine; ctx.lineJoin = 'round';
+    ctx.lineWidth = hot ? 1.5 : 1; ctx.strokeStyle = line; ctx.lineJoin = 'round';
     ctx.beginPath(); this._path(disp.outer); ctx.stroke();
     if (hasInner) { ctx.beginPath(); this._path(disp.inner); ctx.stroke(); }
   }

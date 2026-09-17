@@ -16,13 +16,24 @@
 // outline) and the Mirror setting (both settings make the same solid from mirrored drawings,
 // so the shape is read back with Mirror off, which reproduces this very STL).
 
-import { simplify, bounds, signedArea, offsetPolygon, intersectPolygons, FAT, DEFAULT_PARAMS } from './geometry.js';
+import { simplify, bounds, signedArea, offsetPolygon, intersectPolygons, subtractPolygons, unionPolygons,
+         closeGaps, FAT, DEFAULT_PARAMS } from './geometry.js';
 
 const MIN_FACE_AREA = 0.5; // mm² — a smaller horizontal face is a CSG crumb, not the top of a tier
 const LEVEL_MERGE = 0.05;  // mm — faces closer together than this are one level (tiers overlap by 0.02)
 const MIN_BAR_AREA = 0.2;  // mm² — below this a "bar" is a rounding sliver along the cut line
 const CHANNEL_BACK = 0.05; // mm the channel is held back from both cut lines, so the boolean that
                            // lifts the bars out never has to cut along an edge it already shares
+const ON_END = 0.1;        // mm — an edge whose middle is this close to the side of the channel is
+                           // the end of a bar, cut off by it, and not one of the bar's own sides
+// How much thicker than the thinnest blade on the plate a wall may be and still count as a blade
+// rather than as the edge of the plate. Blades are measured, not assumed; this is only the slack
+// that keeps a 0.4 mm blade read as 0.41 on one side and 0.43 on the other on the same footing.
+const BLADE_SLACK = 1.35;
+// mm a contour may shift between two tiers and still count as standing still. A wall is a band:
+// it stands on its cut line and grows away from it, so the cut-line edge is in the same place at
+// every tier while the other edge moves by the difference between the two widths — millimetres.
+const SAME_EDGE = 0.05;
 
 // ---------- reading the file ----------
 
@@ -323,9 +334,8 @@ function convexHull(pts) {
   return half(p).concat(half(p.reverse()));
 }
 
-// The narrowest way across a bar, and the direction it runs in. A bar is a rectangle with its
-// ends cut off by the two cut lines, so its narrowest span is exactly the thickness it was given.
-function barAxis(poly) {
+// The narrowest way across a shape, and the direction that span is measured along.
+function narrowest(poly) {
   const h = convexHull(poly);
   let width = Infinity, dir = { x: 1, y: 0 };
   for (let i = 0; i < h.length; i++) {
@@ -343,6 +353,32 @@ function barAxis(poly) {
   return { width, dir };
 }
 
+// The thickness of a bar, and the direction it runs in. A bar is a rectangle with its ends cut
+// off by the two sides of the channel: its own sides are the edges that lie on neither, they are
+// straight and parallel, and the distance between them is the thickness it was given. Taking the
+// narrowest span of the piece instead is that same distance only while a bar is longer than it is
+// thick — a 12 mm bar across a 9 mm channel answers with the channel. So the sides are picked out
+// first, by the one thing that tells them apart from the ends, and the span is taken across them.
+function barAxis(poly, ends) {
+  let dir = null, longest = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const ex = b.x - a.x, ey = b.y - a.y, len = Math.hypot(ex, ey);
+    if (len <= longest) continue;
+    const m = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    if (ends.some(e => distToPolygon(m, e) < ON_END)) continue;
+    longest = len; dir = { x: ex / len, y: ey / len };
+  }
+  if (!dir) return narrowest(poly); // a channel too shallow to have sides worth the name
+  const nx = -dir.y, ny = dir.x;
+  let lo = Infinity, hi = -Infinity;
+  for (const q of poly) {
+    const d = q.x * nx + q.y * ny;
+    if (d < lo) lo = d; if (d > hi) hi = d;
+  }
+  return { width: hi - lo, dir };
+}
+
 function centroid(poly) {
   let a = 0, cx = 0, cy = 0;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -357,24 +393,62 @@ const round = (v, d = 2) => Math.round(v * 10 ** d) / 10 ** d;
 
 // ---------- the connection bars ----------
 
+const overlaps = (a, b) => a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
+
+// Is this void one of the pockets the bars divide the channel into? Tested at the vertex standing
+// clearest of both cut lines: a pocket's boundary runs along them, and on the line itself inside
+// and outside are a coin toss.
+function inChannel(pts, outer, inner) {
+  let best = pts[0], far = -1;
+  for (const p of pts) {
+    const d = Math.min(distToPolygon(p, outer), distToPolygon(p, inner));
+    if (d > far) { far = d; best = p; }
+  }
+  return inside(best, outer) && !inside(best, inner);
+}
+
+// How far a wall's base reaches past its cut line into the channel. The pockets stop where that
+// flange starts, so the distance from a pocket to the cut line is the overhang — the one thing
+// about the channel the cut lines themselves cannot say. The middle pocket answers, so that a
+// void which is no pocket of this channel at all cannot decide it.
+function flangeReach(pockets, line) {
+  if (!pockets.length) return 0;
+  const ds = pockets.map(p => gapBetween(p.pts, line)).sort((a, b) => a - b);
+  return ds[ds.length >> 1];
+}
+
 // The bars are whatever fills the channel between the two cut lines at base height.
+//
+// Cutter's own walls grow away from the cut piece, so the channel starts at the cut lines and
+// holding it back a hair from each is enough. Plenty of cutters are not built that way: a base
+// flange that overhangs its cut line towards the cut piece runs right round the channel and joins
+// every bar into a single ring — one bar as wide as the shape, at whatever angle a hull happens
+// to answer with. The pockets say where each flange ends, so the channel is held back to them.
 function readBars(baseRings, outer, inner) {
-  const chan = [orient(offsetPolygon(outer, -CHANNEL_BACK) || outer, true),
-                orient(offsetPolygon(inner, CHANNEL_BACK) || inner, false)];
+  // On a merged lump every other shape's voids are in here too; their boxes rule them out for
+  // the price of a bounds(), before anything is measured against a contour point by point.
+  const ob = bounds(outer);
+  const pockets = baseRings.filter(r => r.depth % 2 === 1 && r.pts.length > 2
+    && overlaps(bounds(r.pts), ob) && inChannel(r.pts, outer, inner));
+  const back = (line, sign) => offsetPolygon(line, sign * (CHANNEL_BACK + flangeReach(pockets, line))) || line;
+  const chan = [orient(back(outer, -1), true), orient(back(inner, 1), false)];
   const bars = intersectPolygons(baseRings.map(r => r.pts), chan).filter(p => signedArea(p) > MIN_BAR_AREA);
   if (!bars.length) return { count: 0, width: null, angle: 0, even: true };
 
   const ic = bounds(inner);
   const widths = [], angles = [];
   for (const b of bars) {
-    const { width, dir } = barAxis(b);
+    const { width, dir } = barAxis(b, chan);
     const c = centroid(b);
     const away = (c.x - ic.cx) * dir.x + (c.y - ic.cy) * dir.y >= 0 ? 1 : -1;
     widths.push(width);
     angles.push(Math.atan2(away * dir.y, away * dir.x));
   }
+  // Cutter makes every connection the same thickness, so a model whose bars differ has to be
+  // answered with one of them: the middle one, and of an even pair the thinner, which is the one
+  // that fits the channel wherever the other would.
   const sorted = widths.slice().sort((a, b) => a - b);
-  const width = sorted[sorted.length >> 1];
+  const width = sorted[(sorted.length - 1) >> 1];
 
   // Bars sit every 360/count degrees, so count times the angle is the same for all of them;
   // averaging there and dividing back gives the rotation of the whole pattern.
@@ -394,9 +468,233 @@ const orient = (pts, ccw) => (signedArea(pts) > 0) === ccw ? pts : pts.slice().r
 
 // ---------- the whole job ----------
 
-// One solid -> the drawing and the settings that build it again.
-// Returns { shape, params, size, footprint, tiers, notes, outlineOnly }, in screen space (y down).
-export function readCutter(pos) {
+// Are these two contours the same piece of the plate? A cut line met again a tier lower is, and
+// so is one of the pockets the connection bars divide a channel into — neither is a new cutter.
+// They are never the tidy same polygon: a neighbour's base eats into a cut region a tier down,
+// and a pocket is a slice of one. Half of the smaller is the line between "this again" and "a
+// shape of its own", which is nowhere near anything a plate can produce.
+function sameRegion(a, b) {
+  const small = Math.min(Math.abs(signedArea(a)), Math.abs(signedArea(b)));
+  if (small < 1e-6) return false;
+  let over = 0;
+  try { for (const p of intersectPolygons([orient(a, true)], [orient(b, true)])) over += Math.abs(signedArea(p)); }
+  catch { return false; }
+  return over > small * 0.5;
+}
+
+// The outer edge of the tier a cut line stands in: the smallest outermost contour around it.
+// A solid can hold more than one — shapes welded together lower down but standing apart up here.
+function edgeAround(rings, cut) {
+  return rings.filter(r => r.depth === 0 && inside(cut[0], r.pts))
+    .sort((a, b) => Math.abs(a.area) - Math.abs(b.area))[0] || null;
+}
+
+// How thick the material between two voids is: the closest the two contours come to each other.
+function gapBetween(a, b) {
+  let best = Infinity;
+  for (const p of a) { const d = distToPolygon(p, b); if (d < best) best = d; }
+  for (const p of b) { const d = distToPolygon(p, a); if (d < best) best = d; }
+  return best;
+}
+
+// The cut regions in one section.
+//
+// A void in the material is usually a cut region — the hole a blade leaves in the section. But
+// shapes that were allowed to overlap have blades running through each other's regions, and every
+// crossing cuts the region it passes through into pieces. The pieces are not shapes: the wall
+// between two of them is a blade, not the edge of the plate.
+//
+// Which shape a wall belongs to is readable, and not by guessing. A wall is a band: it stands on
+// its cut line and grows away from it, so at a tier whose walls are a different width the
+// cut-line edge is in exactly the same place and the other edge has moved. Take the face on the
+// far side of a wall away from the region, wall and all, and what is left is the shape that wall
+// belongs to — with its own cut line running through where the pieces met.
+//
+// `ref` is the rings of a tier whose walls are a different width; without one (a solid of a single
+// tier) nothing can be told apart and the pieces come back joined, which `merged` says.
+function regionsOf(rings, ref, bridge) {
+  const faces = rings.filter(r => r.depth === 1);
+  const one = (pts, merged = 1) => ({ pts, merged });
+  if (faces.length < 2) return faces.map(f => one(f.pts));
+
+  // Voids no further apart than a blade are pieces of one region; anything further apart is
+  // another cutter on the plate, and a void standing on its own is a cut line as it was drawn.
+  const parent = faces.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const walls = [];
+  for (let a = 0; a < faces.length; a++) {
+    for (let b = a + 1; b < faces.length; b++) {
+      const t = gapBetween(faces[a].pts, faces[b].pts);
+      if (t > bridge) continue;
+      walls.push({ a: faces[a], b: faces[b], t });
+      if (find(a) !== find(b)) parent[find(a)] = find(b);
+    }
+  }
+  const groups = new Map();
+  faces.forEach((f, i) => {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(f);
+  });
+
+  const mates = ref ? mateFaces(faces, ref.filter(r => r.depth === 1)) : new Map();
+  const out = [];
+  for (const g of groups.values()) {
+    if (g.length === 1) { out.push(one(g[0].pts)); continue; }
+    const mine = walls.filter(w => g.includes(w.a) && g.includes(w.b));
+    // A closing radius of one wall bridges it from both sides with room to spare. Tighter than
+    // that and the rounding at the crossings costs more than the bridging saves.
+    const widest = mine.reduce((t, w) => Math.max(t, w.t), 0);
+    let U = [];
+    try { U = closeGaps(g.map(f => f.pts), widest); } catch { U = []; }
+    // Pieces that will not close into one region are past reading; hand back what is there.
+    if (!U.length) { out.push(...g.map(f => one(f.pts))); continue; }
+    if (U.length > 1) { out.push(...U.map(p => one(p, g.length))); continue; }
+
+    const shapes = [];
+    for (const w of mine) {
+      const cut = cutSideOf(w, mates);
+      if (!cut) continue;                       // both edges moved: two bands meeting, not one wall
+      const off = cut === w.a ? w.b : w.a;
+      let grown = null;
+      try { grown = offsetPolygon(off.pts, w.t); } catch { grown = null; }
+      if (!grown) continue;
+      let left = [];
+      try { left = subtractPolygons(U, [grown]).filter(p => signedArea(p) > 1); } catch { continue; }
+      for (const r of left) if (!shapes.some(s => sameShape(s, r))) shapes.push(r);
+    }
+    // Every piece has to end up inside one of the shapes, and together they have to be the whole
+    // region — otherwise the reading does not account for what is in the file, and saying so is
+    // worth more than handing back shapes nobody drew.
+    const whole = Math.abs(signedArea(U[0]));
+    const covered = shapes.length > 1 && g.every(f => shapes.some(s => covers(s, f.pts)));
+    const ok = covered && Math.abs(polysArea(unionPolygons(shapes.map(orientCCW))) - whole) < whole * 0.02;
+    if (ok) out.push(...shapes.map(s => one(s)));
+    else out.push(...U.map(p => one(p, g.length)));
+  }
+  return out.sort((a, b) => Math.abs(signedArea(b.pts)) - Math.abs(signedArea(a.pts)));
+}
+
+const orientCCW = (pts) => orient(pts, true);
+const polysArea = (list) => list.reduce((t, p) => t + Math.abs(signedArea(p)), 0);
+
+// Does `s` hold all of `f`? Used to check that every piece of a region ended up in a shape.
+function covers(s, f) {
+  try { return polysArea(subtractPolygons([orientCCW(f)], [orientCCW(s)])) < Math.abs(signedArea(f)) * 0.02; }
+  catch { return false; }
+}
+
+// Two readings of the same shape — the same wall met from both ends gives one region twice over.
+function sameShape(a, b) {
+  const big = Math.max(Math.abs(signedArea(a)), Math.abs(signedArea(b)));
+  if (!big) return false;
+  let over = 0;
+  try { for (const p of intersectPolygons([orientCCW(a)], [orientCCW(b)])) over += Math.abs(signedArea(p)); }
+  catch { return false; }
+  return over > big * 0.97;
+}
+
+// The same void seen at another tier: the one it overlaps most. A face is eaten into by its
+// neighbours' walls as those get wider, so it is never quite the same polygon — but it is always
+// the one in the same place.
+function mateFaces(here, there) {
+  const map = new Map();
+  for (const f of here) {
+    let best = null, most = 0;
+    for (const g of there) {
+      let over = 0;
+      try { for (const p of intersectPolygons([f.pts], [g.pts])) over += Math.abs(signedArea(p)); }
+      catch { over = 0; }
+      if (over > most) { most = over; best = g; }
+    }
+    if (best) map.set(f, best);
+  }
+  return map;
+}
+
+// Which edge of a wall is a cut line: the one that is in the same place at the other tier.
+// Returns the face on that side, or null when neither edge stood still (the two bands of two
+// different shapes meeting) or when the wall could not be found again.
+function cutSideOf(w, mates) {
+  const moved = (face, other) => {
+    const mate = mates.get(face);
+    if (!mate) return Infinity;
+    const along = face.pts.filter(p => distToPolygon(p, other.pts) < w.t * 1.8);
+    if (along.length < 3) return Infinity;
+    const ds = along.map(p => distToPolygon(p, mate.pts)).sort((x, y) => x - y);
+    return ds[ds.length >> 1];
+  };
+  const da = moved(w.a, w.b), db = moved(w.b, w.a);
+  if (da < SAME_EDGE && db >= SAME_EDGE) return w.a;
+  if (db < SAME_EDGE && da >= SAME_EDGE) return w.b;
+  return null;
+}
+
+// One cutter out of a solid that may hold several: the cut line, the tiers it stands in, and the
+// settings measured off them. `tiers` are the solid's, `top` the index of the highest one this
+// cut line reaches — its blade.
+function readOne(cut, tiers, top, bb, notes) {
+  const params = { ...DEFAULT_PARAMS, mirror: false, height: round(tiers[top].z1 - bb.minZ) };
+  const stack = tiers.slice(0, top + 1).map(t => ({ ...t, edge: edgeAround(t.rings, cut) }));
+
+  // The inner wall is the next contour in: inside this cut line, with nothing between.
+  const innerRing = tiers[top].rings
+    .filter(r => r.depth === 2 && inside(r.pts[0], cut))
+    .sort((a, b) => Math.abs(b.area) - Math.abs(a.area))[0];
+  const inner = innerRing && Math.abs(innerRing.area) > 1 ? innerRing.pts : null;
+
+  for (const t of stack) t.w = t.edge ? wallWidth(cut, t.edge.pts) - FAT : null;
+  const wall = stack.filter(t => t.w > 0);
+  if (!wall.length) throw new Error('The walls of this cutter could not be measured.');
+  // Tiers of the same width are one tier — buildCutter merges them on the way out, and a plate
+  // whose shapes are not all the same height puts a level through a wall that does not change
+  // there at all. Putting them back together is what keeps such a shape's step where it was.
+  for (let i = wall.length - 2; i >= 0; i--) {
+    if (Math.abs(wall[i].w - wall[i + 1].w) < 0.02) { wall[i].z1 = wall[i + 1].z1; wall.splice(i + 1, 1); }
+  }
+
+  params.bladeWidth = round(Math.max(0.3, wall[wall.length - 1].w));
+  if (wall.length === 1) {
+    params.baseHeight = 0; params.baseWidth = params.bladeWidth; params.ridge = false;
+    notes.push('This cutter has no base flange.');
+  } else {
+    params.baseHeight = round(wall[0].z1 - bb.minZ);
+    params.baseWidth = round(wall[0].w);
+    params.ridge = wall.length >= 3;
+    if (params.ridge) {
+      const step = wall[wall.length - 2];
+      params.ridgeWidth = round(step.w);
+      params.ridgeHeight = round(step.z1 - wall[0].z1);
+    }
+    if (wall.length > 3) notes.push(`This cutter is stepped ${wall.length} times; Cutter builds three tiers, so the middle ones came back as one.`);
+  }
+
+  if (inner) {
+    const base = wall.length > 1 ? wall[0] : null;
+    const bars = base ? readBars(base.rings, cut, inner) : { count: 0, width: null, angle: 0, even: true };
+    params.bridgeCount = Math.min(12, bars.count);
+    if (bars.width) params.bridgeWidth = round(Math.max(0.5, bars.width));
+    params.bridgeAngle = round(bars.angle, 1);
+    if (bars.count > 12) notes.push(`${bars.count} connections were found; Cutter makes at most 12.`);
+    if (!bars.even) notes.push('The connections are not all the same thickness; the middle one was used for all of them.');
+  }
+  return { cut, inner, params, tiers: wall.length };
+}
+
+// Model space is y up, screen space y down. With Mirror off the two are one flip apart, which
+// is exactly the drawing whose top view is this STL.
+const toScreen = (pts) => {
+  const s = pts.map(q => ({ x: q.x, y: -q.y }));
+  return signedArea(s) < 0 ? s.reverse() : s;
+};
+
+// One solid -> the cutter, or the cutters, in it.
+//
+// A solid is usually one cutter. Shapes that were allowed to overlap were unioned into a single
+// watertight object, though, so one solid can hold several cut lines — one per cutter — and each
+// of them has to be measured on its own: its own height, its own walls, its own connections.
+// Returns { parts, tiers, footprint, notes }; every part is in screen space (y down).
+export function readSolid(pos) {
   const bb = box3(pos);
   if (bb.depth < 1) throw new Error('This model is flat — a cutter has to stand up.');
   if (bb.width < 2 || bb.height < 2) throw new Error('This model is too small to be a cutter.');
@@ -412,73 +710,83 @@ export function readCutter(pos) {
   if (!tiers.length) tiers.push({ z0: bb.minZ, z1: bb.maxZ });
   for (const t of tiers) t.rings = sliceRings(pos, (t.z0 + t.z1) / 2);
 
+  // How thin a wall between two voids has to be to be a blade rather than the edge of the plate.
+  // Every blade on the plate stands between its cut line and the open air, so the closest any cut
+  // region comes to the outline around it is the thinnest blade there is — measured, not assumed.
   const top = tiers[tiers.length - 1];
-  const params = { ...DEFAULT_PARAMS, mirror: false, height: round(bb.depth) };
+  let bridge = 0;
+  for (const r of top.rings.filter(r => r.depth === 1)) {
+    const edge = edgeAround(top.rings, r.pts);
+    if (edge) bridge = bridge ? Math.min(bridge, gapBetween(r.pts, edge.pts)) : gapBetween(r.pts, edge.pts);
+  }
+  bridge = Math.min(Math.max(bridge * BLADE_SLACK, 0.1), 5);
 
-  // The blade: a ring, so the cut line is the hole in it. Anything else is not a cutter, and the
-  // best that can be done is to take the silhouette and leave the settings alone.
-  const cutRing = atDepth(top.rings, 1);
-  const outlineOnly = !cutRing;
-  const outer = cutRing ? cutRing.pts : (atDepth(top.rings, 0)?.pts || null);
-  if (!outer) throw new Error('Nothing was found at the top of this model — it does not look like a cutter.');
-  if (outlineOnly) notes.push('No blade was found in this STL, so its outline at the top was used and the wall settings were left as they are.');
-
-  let inner = null;
-  if (!outlineOnly) {
-    const innerRing = atDepth(top.rings, 2);
-    if (innerRing && Math.abs(innerRing.area) > 1) inner = innerRing.pts;
-
-    for (const t of tiers) {
-      const edge = atDepth(t.rings, 0);
-      t.w = edge ? wallWidth(outer, edge.pts) - FAT : null;
-    }
-    const wall = tiers.filter(t => t.w > 0);
-    if (!wall.length) throw new Error('The walls of this cutter could not be measured.');
-
-    params.bladeWidth = round(Math.max(0.3, wall[wall.length - 1].w));
-    if (wall.length === 1) {
-      params.baseHeight = 0; params.baseWidth = params.bladeWidth; params.ridge = false;
-      notes.push('This cutter has no base flange.');
-    } else {
-      params.baseHeight = round(wall[0].z1 - bb.minZ);
-      params.baseWidth = round(wall[0].w);
-      params.ridge = wall.length >= 3;
-      if (params.ridge) {
-        const step = wall[wall.length - 2];
-        params.ridgeWidth = round(step.w);
-        params.ridgeHeight = round(step.z1 - wall[0].z1);
-      }
-      if (wall.length > 3) notes.push(`This cutter is stepped ${wall.length} times; Cutter builds three tiers, so the middle ones came back as one.`);
-    }
-
-    if (inner) {
-      const base = wall.length > 1 ? wall[0] : null;
-      const bars = base ? readBars(base.rings, outer, inner) : { count: 0, width: null, angle: 0, even: true };
-      params.bridgeCount = Math.min(12, bars.count);
-      if (bars.width) params.bridgeWidth = round(Math.max(0.5, bars.width));
-      params.bridgeAngle = round(bars.angle, 1);
-      if (bars.count > 12) notes.push(`${bars.count} connections were found; Cutter makes at most 12.`);
-      if (!bars.even) notes.push('The connections are not all the same thickness; the middle one was used for all of them.');
+  // Every cut region in the solid, working down from the top: one that no cutter found so far
+  // already covers is a cutter of its own, and the tier it first shows up in is its blade. Coming
+  // down rather than up is what gives a shorter shape beside a taller one its own height, and what
+  // keeps the pockets between connection bars from being read as shapes of their own.
+  const found = [];
+  for (let i = tiers.length - 1; i >= 0; i--) {
+    // the tier to read the walls against: any other one, because what matters is only that its
+    // walls are a different width. The base is the widest, so everything above is read against it
+    // and it is read against the blade.
+    const ref = tiers.length > 1 ? tiers[i === 0 ? tiers.length - 1 : 0] : null;
+    for (const r of regionsOf(tiers[i].rings, ref && ref.rings, bridge)) {
+      if (found.some(c => sameRegion(c.cut, r.pts))) continue;
+      found.push({ cut: r.pts, top: i, merged: r.merged });
     }
   }
+  // Where the walls could not be read — a solid of a single tier has no second width to read them
+  // against, and a reading that does not account for every piece is not a reading — the pieces come
+  // back joined, as the outline around them. Handing back a shape per piece would give each one a
+  // wall and a base of its own, which is the one answer that is certainly wrong.
+  const pieces = found.reduce((n, c) => n + (c.merged > 1 ? c.merged : 0), 0);
+  if (pieces) {
+    notes.push(`This model was printed as one object with blades running through it, and which shape each blade belonged to could not be read off the model; the ${pieces} pieces they cut came back as the ${found.filter(c => c.merged > 1).length === 1 ? 'outline' : 'outlines'} around them. Saving a project file keeps the shapes themselves.`);
+  }
 
-  // Model space is y up, screen space y down. With Mirror off the two are one flip apart, which
-  // is exactly the drawing whose top view is this STL.
-  const toScreen = (pts) => {
-    const s = pts.map(q => ({ x: q.x, y: -q.y }));
-    return signedArea(s) < 0 ? s.reverse() : s;
-  };
-  const shape = { outer: toScreen(outer), inner: inner ? toScreen(inner) : [] };
-  const size = bounds(shape.outer);
+  // Nothing with a blade in it is not a cutter; the best that can be done is to take the
+  // silhouette at the top and leave the wall settings alone.
+  if (!found.length) {
+    const outline = atDepth(top.rings, 0);
+    if (!outline) throw new Error('Nothing was found at the top of this model — it does not look like a cutter.');
+    notes.push('No blade was found in this STL, so its outline at the top was used and the wall settings were left as they are.');
+    const shape = { outer: toScreen(outline.pts), inner: [] };
+    const size = bounds(shape.outer);
+    return {
+      parts: [{ shape, params: { ...DEFAULT_PARAMS, mirror: false, height: round(bb.depth) },
+                size: { width: size.width, height: size.height }, tiers: tiers.length,
+                points: shape.outer.length, outlineOnly: true, notes }],
+      tiers: tiers.length, notes,
+      footprint: { width: bb.width, height: bb.height, height3d: bb.depth },
+    };
+  }
+
+  const parts = [];
+  for (const c of found) {
+    const own = [];
+    let one;
+    try { one = readOne(c.cut, tiers, c.top, bb, own); }
+    catch { continue; }   // a cut line whose walls make no sense is not a shape; the others still are
+    for (const n of own) if (!notes.includes(n)) notes.push(n);
+    const shape = { outer: toScreen(one.cut), inner: one.inner ? toScreen(one.inner) : [] };
+    const size = bounds(shape.outer);
+    parts.push({
+      shape,
+      params: one.params,
+      size: { width: size.width, height: size.height },
+      tiers: one.tiers,
+      points: shape.outer.length + shape.inner.length,
+      outlineOnly: false,
+      notes: own,
+    });
+  }
+  if (!parts.length) throw new Error('The walls of this cutter could not be measured.');
   return {
-    shape,
-    params,
-    size: { width: size.width, height: size.height },
-    footprint: { width: bb.width, height: bb.height, height3d: bb.depth },
+    parts,
     tiers: tiers.length,
-    points: shape.outer.length + shape.inner.length,
-    outlineOnly,
     notes,
+    footprint: { width: bb.width, height: bb.height, height3d: bb.depth },
   };
 }
 
@@ -489,19 +797,21 @@ export function importSTL(buffer) {
   const solids = splitSolids(pos);
   const parts = [];
   const notes = [];
-  if (solids.length === 1) {
-    parts.push(readCutter(solids[0]));
-  } else {
-    let skipped = 0;
-    for (const sp of solids) {
-      try { parts.push(readCutter(sp)); } catch { skipped++; }
-    }
-    // Nothing usable: let the biggest lump say why, in its own words.
-    if (!parts.length) readCutter(solids[0]);
-    notes.push(`${parts.length} shapes were found in this file; each came back with its own settings.`);
-    if (skipped) notes.push(`${skipped} piece${skipped === 1 ? '' : 's'} too small to be a cutter ${skipped === 1 ? 'was' : 'were'} left out.`);
+  let skipped = 0, firstError = null;
+  for (const sp of solids) {
+    try {
+      const read = readSolid(sp);
+      parts.push(...read.parts);
+      for (const n of read.notes) if (!notes.includes(n)) notes.push(n);
+    } catch (e) { firstError = firstError || e; skipped++; }
   }
-  for (const part of parts) for (const n of part.notes) if (!notes.includes(n)) notes.push(n);
+  // Nothing usable: let the lump that failed first say why, in its own words.
+  if (!parts.length) throw firstError || new Error('Nothing in this file looks like a cutter.');
+  parts.sort((a, b) => b.size.width * b.size.height - a.size.width * a.size.height);
+  if (parts.length > 1) {
+    notes.unshift(`${parts.length} shapes were found in this file; each came back with its own settings.`);
+  }
+  if (skipped) notes.push(`${skipped} piece${skipped === 1 ? '' : 's'} too small to be a cutter ${skipped === 1 ? 'was' : 'were'} left out.`);
 
   const bb = box3(pos);
   const all = parts.map(p => p.shape.outer).flat();

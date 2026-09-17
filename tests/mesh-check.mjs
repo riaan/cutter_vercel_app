@@ -87,8 +87,10 @@ const plates = [
     { shape: { outer: at(circ(20), -40, 0), inner: at(circ(10), -40, 0) }, params: {} },
     { shape: { outer: at(circ(20), 40, 0), inner: at(circ(10), 40, 0) }, params: {} },
   ]],
+  // -62, not -50: the star's left-hand point reaches out far enough that a circle at -50 has its
+  // base inside the star's, which makes this a plate of two objects rather than three.
   ['plate: three shapes, each its own settings', [
-    { shape: { outer: at(circ(18), -50, 0), inner: null }, params: { height: 12, bladeWidth: 0.5 } },
+    { shape: { outer: at(circ(18), -62, 0), inner: null }, params: { height: 12, bladeWidth: 0.5 } },
     { shape: { outer: at(star, 0, 0), inner: at(circ(8), 0, 0) }, params: { height: 20, ridge: false, bridgeCount: 5 } },
     { shape: { outer: at(circ(15), 55, 10), inner: null }, params: { height: 15, baseWidth: 4, baseHeight: 2 } },
   ]],
@@ -97,12 +99,55 @@ const plates = [
     { shape: { outer: at(circ(20), 45, 0), inner: null }, params: { mirror: true } },
   ]],
 ];
-for (const [label, parts] of plates) {
+for (const [label, parts, objects] of plates) {
   const res = G.buildAll(parts.map(p => ({ ...p, params: { ...G.DEFAULT_PARAMS, ...p.params } })));
   const r = check(res);
-  const ok = r.open === 0 && r.nonManifold === 0 && res.parts.length === parts.length;
+  const want = objects === undefined ? parts.length : objects;
+  const ok = r.open === 0 && r.nonManifold === 0 && res.parts.length === parts.length && res.objects === want;
   if (!ok) failed++;
-  console.log(`${ok ? 'PASS' : 'FAIL'} ${label}: ${res.parts.length} shapes, ${r.triangles} triangles, ${r.open} open, ${r.nonManifold} non-manifold, ${r.volume.toFixed(0)} mm³`);
+  console.log(`${ok ? 'PASS' : 'FAIL'} ${label}: ${res.parts.length} shapes, ${res.objects} object(s) (want ${want}), ${r.triangles} triangles, ${r.open} open, ${r.nonManifold} non-manifold, ${r.volume.toFixed(0)} mm³`);
+}
+
+// Shapes that run into each other are one piece of plastic, so they have to come out as one
+// solid: two surfaces crossing inside the print is the one thing a slicer cannot make sense of.
+// The union has to be watertight, and it has to be smaller than the two shapes added up.
+{
+  const apart = [
+    { shape: { outer: at(circ(20), -40, 0), inner: null }, params: { ...G.DEFAULT_PARAMS } },
+    { shape: { outer: at(circ(20), 40, 0), inner: null }, params: { ...G.DEFAULT_PARAMS } },
+  ];
+  const sum = G.buildAll(apart).volumeMm3;
+  const overlaps = [
+    ['two circles, cut lines crossing', 14],
+    ['two circles, bases touching', 22.5],   // 20 + 20 apart is 2.5 mm of base overlap either side
+  ];
+  for (const [label, dx] of overlaps) {
+    const parts = [
+      { shape: { outer: at(circ(20), -dx, 0), inner: null }, params: { ...G.DEFAULT_PARAMS } },
+      { shape: { outer: at(circ(20), dx, 0), inner: null }, params: { ...G.DEFAULT_PARAMS } },
+    ];
+    const res = G.buildAll(parts);
+    const r = check(res);
+    const ok = r.open === 0 && r.nonManifold === 0 && res.objects === 1 && res.parts.length === 2
+      && res.volumeMm3 < sum - 1;
+    if (!ok) failed++;
+    console.log(`${ok ? 'PASS' : 'FAIL'} plate merged: ${label}: ${res.objects} object(s), ${r.triangles} triangles, ${r.open} open, ${r.nonManifold} non-manifold, ${r.volume.toFixed(0)} mm³ (apart: ${sum.toFixed(0)} mm³)`);
+  }
+}
+
+// Three shapes, two of them on top of each other: only those two are joined, and the one
+// standing on its own is left alone.
+{
+  const parts = [
+    { shape: { outer: at(circ(20), -14, 0), inner: null }, params: { ...G.DEFAULT_PARAMS } },
+    { shape: { outer: at(circ(20), 14, 0), inner: null }, params: { ...G.DEFAULT_PARAMS } },
+    { shape: { outer: at(circ(15), 80, 0), inner: at(circ(7), 80, 0) }, params: { ...G.DEFAULT_PARAMS } },
+  ];
+  const res = G.buildAll(parts);
+  const r = check(res);
+  const ok = r.open === 0 && r.nonManifold === 0 && res.objects === 2 && res.parts.length === 3;
+  if (!ok) failed++;
+  console.log(`${ok ? 'PASS' : 'FAIL'} plate merged: only the shapes that meet: ${res.objects} object(s), ${r.open} open, ${r.nonManifold} non-manifold`);
 }
 
 // A shape that cannot be built says which one it is, so the message points at a shape in the list.

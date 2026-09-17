@@ -5,7 +5,7 @@ import { importSTL } from './stlimport.js';
 import { PRESETS, PRESET_SIZE_MM } from './presets.js';
 import { packProject, unpackProject, PROJECT_EXT } from './project.js';
 import { buildAll, toBinarySTL, offsetPolygon, cleanPolygon, bounds, bridgeShapes, signedArea, simplify,
-         unionPolygons, loadManifold, manifoldReady, DEFAULT_PARAMS } from './geometry.js';
+         unionPolygons, subtractPolygons, loadManifold, manifoldReady, DEFAULT_PARAMS } from './geometry.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -28,7 +28,8 @@ const editor = new ShapeEditor($('drawCanvas'), {
   onSelect: updatePointBar,
   onMenu: openPointMenu,
   onView: syncZoomUI,
-  onBlock: (msg) => toast(msg),
+  // The guard has no way of saying that it can be lowered, so the toast does it here.
+  onBlock: (msg) => toast(`${msg} “Allow overlap”, under the shapes list, lets them join instead.`),
 });
 const viewer = new CutterViewer($('viewer'));
 params = editor.params;
@@ -50,6 +51,7 @@ function onShapeChange(shape, { selectionOnly = false } = {}) {
   $('undoBtn').disabled = !editor.canUndo;
   $('redoBtn').disabled = !editor.canRedo;
   $('secInnerWrap').hidden = shape.inner.length < 3;
+  syncResetMarks();
   syncWallActions();
   autoBridgeWidth(shape);
   renderShapeList();
@@ -90,6 +92,7 @@ $('bridgeAutoBtn').addEventListener('click', () => {
   editor.layer.bridgeAuto = on;
   $('bridgeAutoBtn').setAttribute('aria-pressed', String(on));
   if (on) { autoBridgeWidth(editor.getShape()); scheduleRegen(); }
+  syncResetMarks();
 });
 
 // Offsets for the 2D preview (walls + connections). Every shape has its own walls, so there is
@@ -185,9 +188,15 @@ function regenerate() {
     $('statFootprint').textContent = `${f.width.toFixed(1)} × ${f.height.toFixed(1)} mm`;
     $('statHeight').textContent = `${f.height3d.toFixed(1)} mm`;
     $('statTris').textContent = `${(cm3 * 1.24).toFixed(1)} g`;
+    // Shapes that run into each other are built as one solid, so the plate can hold fewer objects
+    // than it holds shapes — which is the thing to say, because it is what comes off the printer.
+    const objs = result.objects, joined = objs < built.length;
     $('stats').title = `${cm3.toFixed(1)} cm³ · ${result.triangles.toLocaleString()} triangles`
-      + (built.length > 1 ? ` · ${built.length} shapes` : '');
-    setReady(built.length > 1 ? `${built.length} shapes · ready` : 'Watertight · ready');
+      + (built.length > 1 ? ` · ${built.length} shapes` : '')
+      + (joined ? `, joined into ${objs} object${objs === 1 ? '' : 's'}` : '');
+    setReady(built.length > 1
+      ? `${built.length} shapes${joined ? `, ${objs} object${objs === 1 ? '' : 's'}` : ''} · ready`
+      : 'Watertight · ready');
     checkAgainstSaved();
   } catch (e) {
     result = null; viewer.clearMesh(); setDownloadEnabled(false);
@@ -209,8 +218,10 @@ function download() {
   const a = document.createElement('a');
   a.href = url; a.download = `${name}.stl`; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
-  const n = result.parts ? result.parts.length : 1;
-  toast(`Saved ${name}.stl — ${n > 1 ? `${n} shapes, ` : ''}print it base down, no supports.`);
+  const n = result.parts.length, objs = result.objects;
+  const what = objs < n ? `${n} shapes joined into ${objs === 1 ? 'one object' : `${objs} objects`}, `
+    : n > 1 ? `${n} shapes, ` : '';
+  toast(`Saved ${name}.stl — ${what}print it base down, no supports.`);
 }
 $('downloadBtn').addEventListener('click', download);
 $('downloadBtnMobile').addEventListener('click', download);
@@ -265,28 +276,61 @@ function saveBlob(blob, filename) {
 
 async function openProject(file) {
   let state;
+  await showLoader(`Opening ${file.name}…`);
   try {
     state = await unpackProject(await file.arrayBuffer());
   } catch (e) {
     toast(e.message || 'Could not open that project file.');
     return;
+  } finally {
+    hideLoader();
   }
-  if (editor.hasAnyShape) {
-    const ok = await confirmAction('Open this project?',
-      'Every shape on the canvas now is replaced by the saved drawing and its settings. This cannot be undone.', 'Open');
-    if (!ok) return;
-  }
-  applyState(state);
   const n = state.layers.length;
-  toast(`Opened ${file.name} — ${n > 1 ? `${n} shapes` : 'shape'} and settings restored.`);
+  const mode = await askImportMode(file, n, 'Open this project?',
+    `${file.name} holds ${countShapes(n)}. ${n > 1 ? 'They can' : 'It can'} join what is on the canvas, or take its place — every shape and its settings replaced, which cannot be undone.`);
+  if (!mode) return;
+  if (mode === 'add') {
+    const added = await withLoader('Adding the shapes…', () => addState(state.layers), { build: true });
+    toast(`Added ${countShapes(added)} from ${file.name}.`);
+  } else {
+    await withLoader(`Opening ${file.name}…`, () => applyState(state), { build: true });
+    toast(`Opened ${file.name} — ${n > 1 ? `${n} shapes` : 'shape'} and settings restored.`);
+  }
   setTimeout(warnIfClashing, 1200);
 }
+
+// Adding a file's shapes to the plate instead of opening it: only the shapes come across, each
+// with the wall settings the file gave it. Everything that belongs to the plate rather than to a
+// shape — the file name, the grid, the tool you are holding — is yours and stays as it is.
+// Mirror is the one setting a shape does not get to bring: it turns the whole plate over, so the
+// arrivals take the one the plate is already using.
+function addState(list) {
+  const mirror = editor.params.mirror;
+  const n = editor.addLayers(list.map(it => (it.params ? { ...it, params: { ...it.params, mirror } } : it)));
+  if (!n) { toast('There were no shapes in that file to add.'); return 0; }
+  // Nothing was moved to suit the plate beyond putting the group beside it, so — as with any
+  // file — whether the shapes may sit where they now are is read off the drawing.
+  adoptOverlapFromDrawing();
+  setActive('outer');
+  setTool('move');
+  renderShapeList();
+  editor.requestRender();
+  return n;
+}
+
+const countShapes = (n) => `${n} shape${n === 1 ? '' : 's'}`;
 
 // The shapes go in first, settings and all; everything after that only follows them.
 function applyState(state) {
   shownLayer = null;         // force the settings panel to pick up the shape it lands on
   ringsCache.clear();
   editor.setState(state);
+  // A file states where its shapes go and nothing is moved, so the only thing left to settle is
+  // whether they are allowed to be there. A file that states the setting is taken at its word;
+  // one that cannot — an STL, a project written before the setting existed — is read off the
+  // drawing it brought.
+  if (typeof state.allowOverlap === 'boolean') { overlapAdopted = false; setOverlapAllowed(state.allowOverlap); }
+  else adoptOverlapFromDrawing();
   syncShapeContext();
 
   $('fileName').value = state.name || 'cutter';
@@ -323,19 +367,33 @@ function checkAgainstSaved() {
 // was made: curves come back as the outline they were flattened to, and symmetry is gone.
 async function openSTL(file) {
   let res;
+  await showLoader(`Reading ${file.name}…`);
   try {
     res = importSTL(await file.arrayBuffer());
   } catch (e) {
     toast(e.message || 'Could not read that STL.');
     return;
+  } finally {
+    hideLoader();
   }
-  if (editor.hasAnyShape) {
-    const ok = await confirmAction('Open this STL?',
-      'Every shape on the canvas now is replaced by the shapes and the settings read out of the model. This cannot be undone.', 'Open');
-    if (!ok) return;
+  const n = res.parts.length;
+  const mode = await askImportMode(file, n, 'Open this STL?',
+    `${file.name} holds ${countShapes(n)}, with the wall settings read out of the model. ${n > 1 ? 'They can' : 'It can'} join what is on the canvas, or take its place — every shape and its settings replaced, which cannot be undone.`);
+  if (!mode) return;
+  const notes = res.notes.length ? ' ' + res.notes.join(' ') : '';
+  if (mode === 'add') {
+    // Each cutter in the file keeps the settings measured off it; its connection thickness was
+    // measured too, so it is a typed-in value and not one to work out again.
+    const added = await withLoader('Adding the shapes…',
+      () => addState(res.parts.map(part => ({ shape: part.shape, params: part.params, bridgeAuto: false }))),
+      { build: true });
+    toast(`Added ${countShapes(added)} from ${file.name}.` + notes);
+    setTimeout(warnIfClashing, 1200);
+    return;
   }
-  applyState({
+  await withLoader(`Rebuilding from ${file.name}…`, () => applyState({
     ...editor.getState(), // the grid, the smoothing and the aspect lock are yours, not the file's
+    allowOverlap: null,   // an STL holds no such setting — whether its cutters run into each other does
     // One cutter in the file, one shape on the canvas — each with the settings measured off it.
     layers: res.parts.map(part => ({
       shape: part.shape,
@@ -350,7 +408,7 @@ async function openSTL(file) {
     name: file.name.replace(/\.stl$/i, '').replace(/[^\w\-]+/g, '-') || 'cutter',
     // the same check a project gets: rebuild it and say so if the result is not that model
     stats: { ...res.footprint, warning: 'Opened, but the cutter this builds comes out slightly different from the STL. Check the wall settings.' },
-  });
+  }), { build: true });
   toast(describeSTL(file.name, res));
   setTimeout(warnIfClashing, 1200);
 }
@@ -376,7 +434,7 @@ $('openProjectBtn').addEventListener('click', pickProject);
 $('openProjectBtn2').addEventListener('click', pickProject);
 $('projectInput').addEventListener('change', (e) => {
   const file = e.target.files?.[0]; e.target.value = '';
-  if (file) (isSTL(file) ? openSTL : openProject)(file);
+  beginImport(file);
 });
 setSaveEnabled(false);
 
@@ -384,7 +442,7 @@ setSaveEnabled(false);
 const TOOL_TIPS = {
   draw: 'Drag to sketch the outline in one go.',
   points: 'Tap to place corners one after the other, then click the first one again to close the shape. Hold and pull as you place one and it comes out curved. After that, tap a line to insert a corner. Select one to delete it or give it a curve; right-click (or hold) for the menu.',
-  move: 'Drag the shape to move it — hold Shift to keep it on one line. Use the handles to resize, with Alt to resize around the middle, and the top knob to rotate. Arrow keys nudge it by 1 mm. Two fingers pinch and twist.',
+  move: 'Drag the shape to move it — hold Shift to keep it on one line. Use the handles to resize, with Alt to resize around the middle, and the top knob to rotate. Arrow keys nudge it by 1 mm. Two fingers pinch and twist. Click another shape to pick that one up instead; click the empty canvas to put it down.',
 };
 // The tool explanation stays behind its (i), which sits in the toolbar beside the three tools:
 // it is there to be asked for, never to announce itself, so picking a tool only loads the text
@@ -656,14 +714,16 @@ document.addEventListener('keydown', (e) => {
     const [dx, dy] = ARROWS[e.key], step = e.shiftKey ? 5 : 1;   // millimetres
     editor.nudgePoint(dx * step, dy * step);
   }
-  else if (ARROWS[e.key] && editor.tool === 'move' && !editor.rounding) {
+  else if (ARROWS[e.key] && editor.tool === 'move' && editor.picked && !editor.rounding) {
     e.preventDefault();
     const [dx, dy] = ARROWS[e.key], step = e.shiftKey ? 5 : 1;   // millimetres
     editor.nudgeShape(dx * step, dy * step);
   }
   else if (e.key === 'Enter' && editor.rounding) { e.preventDefault(); $('roundApplyBtn').click(); }
   else if (e.key === 'Escape' && editor.rounding) { e.preventDefault(); editor.cancelRound(); }
-  else if (e.key === 'Escape') { editor.selectPoint(-1); closeMenu(); }
+  // Escape lets go of whatever is being held: the selected point, or the shape the Move tool
+  // has hold of.
+  else if (e.key === 'Escape') { editor.selectPoint(-1); editor.dropShape(); closeMenu(); }
 });
 
 // ---------- size inputs ----------
@@ -692,6 +752,7 @@ function syncParamInputs() {
   $('ridgeFields').hidden = !params.ridge;
   $('pMirror').checked = params.mirror;
   $('bridgeAutoBtn').setAttribute('aria-pressed', String(editor.layer.bridgeAuto));
+  syncResetMarks();
 }
 
 for (const [id, key] of Object.entries(PARAM_INPUTS)) {
@@ -712,10 +773,153 @@ $('pRidge').addEventListener('change', (e) => {
 $('pMirror').addEventListener('change', (e) => setMirror(e.target.checked));
 
 function onParamsChanged() {
+  syncResetMarks();
   drawProfile();
   editor.requestRender();     // the wall bands are keyed on the settings, so they redraw by themselves
   scheduleRegen();
 }
+
+// ---------- settings that are off the default ----------
+// A cutter read back out of an STL arrives with every number measured off the model, so it is
+// usually nowhere near the settings a shape you draw starts from — and nothing on the panel said
+// so. Each setting that differs now carries a small undo arrow, and a row at the top of the panel
+// offers to put the whole shape back at once.
+//
+// A setting only counts while it is on screen and doing something: with the step switched off or
+// with no inner wall, those fields are not shown and build nothing, so they are not a deviation
+// anybody can see. Mirror is left out on purpose — it turns over the whole plate rather than this
+// one shape, which is why it lives under Export and has a confirmation of its own.
+const RESET_FIELDS = [
+  { key: 'height',      name: 'Cutter height',   unit: ' mm' },
+  { key: 'bladeWidth',  name: 'Blade thickness', unit: ' mm' },
+  { key: 'baseWidth',   name: 'Base width',      unit: ' mm' },
+  { key: 'baseHeight',  name: 'Base thickness',  unit: ' mm' },
+  { key: 'ridge',       name: 'Support step',    bool: true },
+  { key: 'ridgeWidth',  name: 'Step width',      unit: ' mm', when: (c) => c.p.ridge },
+  { key: 'ridgeHeight', name: 'Step height',     unit: ' mm', when: (c) => c.p.ridge },
+  { key: 'bridgeCount', name: 'Bars',            unit: '', when: (c) => c.inner },
+  // The thickness has no default number: a shape you draw gets 10% of its width. So what it goes
+  // back to is `auto`, and having auto on *is* being on the default, whatever it works out to.
+  { key: 'bridgeWidth', name: 'Bar thickness',   unit: ' mm', when: (c) => c.inner, auto: true },
+  { key: 'bridgeAngle', name: 'Bar rotation',    unit: '°', when: (c) => c.inner },
+];
+const resetMarks = new Map([...document.querySelectorAll('[data-reset]')].map(b => [b.dataset.reset, b]));
+const showNum = (v) => String(Math.round(v * 1000) / 1000);
+
+// Everything judging a setting needs, so the same rules can be read off a shape you are not on —
+// which is what the marker in the shapes list is: its settings, whether its bar thickness is left
+// to the app, and whether it has an inner wall for the bar settings to belong to. `inner` is the
+// effective contour, so it has to be handed in; the shapes list already has one per shape.
+const shapeCtx = (layer, inner) => ({ p: layer.params, auto: layer.bridgeAuto, inner: inner.length >= 3 });
+const activeCtx = () => shapeCtx(editor.layer, editor.getShape().inner);
+
+function offDefault(f, c) {
+  if (f.when && !f.when(c)) return false;
+  if (f.auto) return !c.auto;
+  if (f.bool) return c.p[f.key] !== DEFAULT_PARAMS[f.key];
+  return Math.abs(c.p[f.key] - DEFAULT_PARAMS[f.key]) > 1e-6;
+}
+const offDefaultCount = (c) => RESET_FIELDS.reduce((n, f) => n + (offDefault(f, c) ? 1 : 0), 0);
+
+function valueText(f, c) {
+  if (f.auto && c.auto) return 'auto';
+  if (f.bool) return c.p[f.key] ? 'on' : 'off';
+  return showNum(c.p[f.key]) + f.unit;
+}
+function defaultText(f) {
+  if (f.auto) return 'auto';
+  if (f.bool) return DEFAULT_PARAMS[f.key] ? 'on' : 'off';
+  return showNum(DEFAULT_PARAMS[f.key]) + f.unit;
+}
+// Mutates only; the caller syncs the panel once for the whole lot.
+function applyReset(f) {
+  if (f.auto) editor.layer.bridgeAuto = true;
+  else params[f.key] = DEFAULT_PARAMS[f.key];
+}
+
+function syncResetMarks() {
+  const c = activeCtx();
+  let n = 0;
+  for (const f of RESET_FIELDS) {
+    const el = resetMarks.get(f.key);
+    if (!el) continue;
+    const off = offDefault(f, c);
+    if (off) { n++; setTip(el, `Reset — the default is ${defaultText(f)}.`); }
+    el.hidden = !off;
+  }
+  $('resetAllRow').hidden = n === 0;
+  $('resetAllNote').textContent = n === 1
+    ? '1 setting differs from the default'
+    : `${n} settings differ from the defaults`;
+  syncShapeFlags();   // the same news, one level up: which shapes on the plate are not standard
+}
+
+// One setting, one press: the value is right there on screen, so there is nothing a dialog
+// could tell you that you cannot already see.
+for (const [key, el] of resetMarks) {
+  el.addEventListener('click', () => {
+    const f = RESET_FIELDS.find(x => x.key === key);
+    if (!f || !offDefault(f, activeCtx())) return;
+    applyReset(f);
+    autoBridgeWidth(editor.getShape());   // a no-op unless the reset was the one that turned auto back on
+    syncParamInputs();
+    onParamsChanged();
+    refreshSummaries();
+  });
+}
+
+// All of them at once is a different matter: several numbers change, some of them in sections
+// that are folded away, and wall settings have no undo. So it says what it is about to do first.
+$('resetAllBtn').addEventListener('click', async () => {
+  const c = activeCtx();
+  const list = RESET_FIELDS.filter(f => offDefault(f, c));
+  if (!list.length) return;
+  if (!await confirmReset(list, c)) return;
+  for (const f of list) applyReset(f);
+  autoBridgeWidth(editor.getShape());
+  syncParamInputs();
+  onParamsChanged();
+  refreshSummaries();
+  toast(list.length === 1
+    ? 'One setting is back to its default.'
+    : `${list.length} settings are back to their defaults.`);
+});
+
+// Before and after, one row per setting. Resolves false on Cancel, Esc or the backdrop.
+function confirmReset(list, c) {
+  const dlg = $('resetDialog');
+  const many = editor.layers.length > 1;
+  $('resetTitle').textContent = many
+    ? `Reset the settings for shape ${editor.index + 1}?`
+    : 'Reset the settings?';
+  $('resetBody').textContent = list.length === 1
+    ? 'One setting goes back to the default:'
+    : `These ${list.length} settings go back to the defaults:`;
+  const table = $('resetTable');
+  table.textContent = '';
+  const cell = (cls, text) => {
+    const d = document.createElement('div');
+    d.className = cls; d.textContent = text;
+    return d;
+  };
+  for (const f of list)
+    table.append(cell('rt-name', f.name), cell('rt-from', valueText(f, c)), cell('rt-arrow', '\u2192'), cell('rt-to', defaultText(f)));
+  $('resetOkLabel').textContent = list.length === 1 ? 'Reset' : `Reset ${list.length} settings`;
+  return new Promise((resolve) => {
+    const done = (ok) => {
+      dlg.removeEventListener('submit', onSubmit);
+      dlg.removeEventListener('close', onClose);
+      resolve(ok);
+    };
+    const onSubmit = () => done(true);   // the close that follows finds no listener left
+    const onClose = () => done(false);
+    dlg.addEventListener('submit', onSubmit);
+    dlg.addEventListener('close', onClose);
+    dlg.showModal();
+    $('resetOkBtn').focus();
+  });
+}
+$('resetCancelBtn').addEventListener('click', () => $('resetDialog').close());
 
 // Cross-section diagram of one wall, so the numbers have a picture.
 function drawProfile() {
@@ -907,17 +1111,59 @@ window.addEventListener('scroll', (e) => {
 }, true);
 
 // ---------- import (SVG outline, or a whole cutter from an STL) ----------
+// One way in for every file, whichever door it came through: the two file pickers and the drop
+// layer all hand it here, and the name decides what it is.
 const isSTL = (file) => /\.stl$/i.test(file.name) || file.type === 'model/stl';
+const isSVG = (file) => /\.svg$/i.test(file.name) || file.type === 'image/svg+xml';
+const isProject = (file) => new RegExp(`\\${PROJECT_EXT}$`, 'i').test(file.name);
+
+// One import at a time: a second file arriving while the first is still being read would put two
+// dialogs on top of each other and two drawings into the same canvas.
+let importing = false;
+// A modal dialog is a question waiting for an answer — the size of the drawing being imported,
+// most of the time. Starting a second import behind it would want the same dialog twice.
+const busyImporting = () => importing || !!document.querySelector('dialog[open]');
+async function beginImport(file) {
+  if (!file || busyImporting()) return;
+  importing = true;
+  try {
+    if (isSTL(file)) await openSTL(file);
+    else if (isSVG(file)) await openSVG(file);
+    else if (isProject(file) || /\.zip$/i.test(file.name)) await openProject(file);
+    else toast(`${file.name} is not a file Cutter can read — drop an SVG outline, an STL cutter or a ${PROJECT_EXT} project.`);
+  } finally {
+    importing = false;
+  }
+}
 
 let pendingSvg = null;
-$('svgInput').addEventListener('change', async (e) => {
+$('svgInput').addEventListener('change', (e) => {
   const file = e.target.files?.[0]; e.target.value = '';
-  if (!file) return;
-  if (isSTL(file)) { openSTL(file); return; }
+  beginImport(file);
+});
+
+async function openSVG(file) {
+  let res;
+  await showLoader(`Reading ${file.name}…`);
   try {
-    const text = await file.text();
-    const res = await importSVG(text);
-    pendingSvg = { res, name: file.name };
+    res = await importSVG(await file.text());
+  } catch (err) {
+    toast(err.message || 'Could not read that SVG.');
+    return;
+  } finally {
+    hideLoader();
+  }
+  try {
+    // An SVG of one plain outline dropped while the inner wall is the one being edited is that
+    // wall, and neither adding a shape nor replacing the plate: it goes where you are working.
+    const innerCase = editor.active === 'inner' && res.shapes.length === 1 && !res.shapes[0].inner;
+    let mode = 'replace';
+    if (!innerCase) {
+      mode = await askImportMode(file, res.shapes.length, 'Import this drawing?',
+        `${file.name} holds ${countShapes(res.shapes.length)}. ${res.shapes.length > 1 ? 'They can' : 'It can'} join what is on the canvas, or take its place.`);
+      if (!mode) return;
+    }
+    pendingSvg = { res, name: file.name, mode: innerCase ? 'replace' : mode };
     // The size asked for is the size of the whole drawing; the shapes in it keep their places
     // and their proportions within it.
     const b = res.bounds;
@@ -931,18 +1177,18 @@ $('svgInput').addEventListener('change', async (e) => {
     $('svgDialogNote').textContent = (res.physical
       ? `${file.name} specifies a physical size (${b.width.toFixed(1)} × ${b.height.toFixed(1)} mm). Change it if needed.`
       : `${file.name} has no physical size, so 80 mm wide is suggested. Set the size you want.`) + found;
-    $('svgDialog').showModal();
+    if (!$('svgDialog').open) $('svgDialog').showModal();
     $('svgWidth').focus(); $('svgWidth').select();
   } catch (err) {
     toast(err.message || 'Could not read that SVG.');
   }
-});
+}
 const svgSize = linkSizeFields('svgWidth', 'svgHeight', 'svgLockBtn');
 $('svgCancelBtn').addEventListener('click', () => { pendingSvg = null; $('svgDialog').close(); });
-$('svgDialog').addEventListener('submit', (e) => {
+$('svgDialog').addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!pendingSvg) return;
-  const { res, name } = pendingSvg; pendingSvg = null;
+  const { res, name, mode } = pendingSvg; pendingSvg = null;
   $('svgDialog').close();
   const b = res.bounds;
   const w = parseFloat($('svgWidth').value), h = parseFloat($('svgHeight').value);
@@ -950,20 +1196,100 @@ $('svgDialog').addEventListener('submit', (e) => {
   // Centre the whole drawing on the canvas, keeping the shapes where they sit inside it.
   const f = p => ({ x: (p.x - b.cx) * sx, y: (p.y - b.cy) * sy });
   const shapes = res.shapes.map(sh => ({ outer: sh.outer.map(f), inner: sh.inner ? sh.inner.map(f) : [] }));
-  let msg = `Imported ${name} at ${(b.width * sx).toFixed(1)} × ${(b.height * sy).toFixed(1)} mm`;
+  let msg = `${mode === 'add' ? 'Added' : 'Imported'} ${name} at ${(b.width * sx).toFixed(1)} × ${(b.height * sy).toFixed(1)} mm`;
   if (shapes.length > 1) msg += ` — ${shapes.length} shapes`;
   else if (shapes[0].inner.length) msg += ' — outer and inner wall';
   if (res.extraHoles) msg += ` (${res.extraHoles} extra hole${res.extraHoles === 1 ? '' : 's'} left out — one inner wall per shape)`;
-  if (editor.active === 'inner' && shapes.length === 1 && !shapes[0].inner.length) {
-    editor.setPoints(shapes[0].outer, { record: true });
-  } else {
-    editor.setLayers(shapes);
-    setActive('outer');
-  }
-  setTool('move');
+  await withLoader(mode === 'add' ? 'Adding the shapes…' : `Importing ${name}…`, () => {
+    if (mode === 'add') { addState(shapes); return; }
+    if (editor.active === 'inner' && shapes.length === 1 && !shapes[0].inner.length) {
+      editor.setPoints(shapes[0].outer, { record: true });
+    } else {
+      editor.setLayers(shapes);
+      setActive('outer');
+    }
+    setTool('move');
+    adoptOverlapFromDrawing();   // a sheet whose shapes touch is imported as it is, guard down
+  }, { build: true });
   toast(msg + '.');
   setTimeout(warnIfClashing, 1200);   // after the "imported" message has had its turn
 });
+
+// ---------- dragging a file into the window ----------
+// Dropping a file on the app is the same import as the two buttons, so it goes through
+// beginImport() like everything else. The layer that comes up while a file is over the window is
+// the answer to "where does this land": the canvas, lit up. It covers the rest of the window too,
+// because a file let go beside the canvas would otherwise be opened by the browser — which
+// throws the drawing away without asking.
+const dropLayer = $('dropLayer'), dropZone = $('dropZone');
+const DROP_LINGER = 700;   // ms without a dragover before the layer is taken to have left
+let dropTimer = 0;
+
+const draggingFile = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+
+// The zone is the canvas, and only the part of it that is on screen: with that panel switched
+// off, or with the canvas scrolled out of the window on a phone, there would be nothing to aim
+// at, so the whole window becomes the zone instead. Measured on every move — panels come and go,
+// and a drag near the edge of the window scrolls the page under it.
+function placeDropZone() {
+  const wrap = document.querySelector('.canvas-wrap');
+  const r = wrap ? wrap.getBoundingClientRect() : null;
+  const left = r ? Math.max(0, r.left) : 0, top = r ? Math.max(0, r.top) : 0;
+  let box = r ? { left, top, width: Math.min(r.right, innerWidth) - left, height: Math.min(r.bottom, innerHeight) - top } : null;
+  if (!box || box.width < 140 || box.height < 120) box = { left: 0, top: 0, width: innerWidth, height: innerHeight };
+  const pad = Math.min(16, box.width * 0.04, box.height * 0.04);
+  const out = { left: box.left + pad, top: box.top + pad, width: box.width - pad * 2, height: box.height - pad * 2 };
+  dropZone.style.left = `${Math.round(out.left)}px`;
+  dropZone.style.top = `${Math.round(out.top)}px`;
+  dropZone.style.width = `${Math.round(out.width)}px`;
+  dropZone.style.height = `${Math.round(out.height)}px`;
+  return out;
+}
+
+function openDropLayer() {
+  dropLayer.hidden = false;
+  clearTimeout(dropTimer);
+  dropTimer = setTimeout(closeDropLayer, DROP_LINGER);
+  return placeDropZone();
+}
+function closeDropLayer() {
+  clearTimeout(dropTimer);
+  dropLayer.hidden = true;
+  dropZone.classList.remove('hot');
+}
+
+// dragover keeps firing while the file is over the window (the browser repeats it even when the
+// pointer stands still), so a timer that it keeps pushing back is what says the file has gone.
+// Counting dragenter against dragleave is the usual way and gets this wrong whenever an element
+// boundary is crossed mid-drag.
+window.addEventListener('dragover', (e) => {
+  if (!draggingFile(e)) return;
+  // Always swallow the drop, even when the app cannot take the file: letting the browser have it
+  // means opening the SVG in this tab, which throws the drawing away without asking. The layer,
+  // though, is only offered when the file can actually land somewhere.
+  e.preventDefault();
+  if (!$('loader').hidden || busyImporting()) { e.dataTransfer.dropEffect = 'none'; return; }
+  e.dataTransfer.dropEffect = 'copy';
+  const r = openDropLayer();
+  const over = e.clientX >= r.left && e.clientX <= r.left + r.width
+            && e.clientY >= r.top && e.clientY <= r.top + r.height;
+  dropZone.classList.toggle('hot', over);
+});
+window.addEventListener('dragleave', (e) => {
+  if (e.relatedTarget === null) closeDropLayer();   // the pointer left the window altogether
+});
+window.addEventListener('dragend', closeDropLayer);
+window.addEventListener('drop', (e) => {
+  if (!draggingFile(e)) return;
+  e.preventDefault();
+  closeDropLayer();
+  if (!$('loader').hidden || busyImporting()) return;
+  const file = e.dataTransfer.files?.[0];
+  if (e.dataTransfer.files?.length > 1) toast(`${e.dataTransfer.files.length} files dropped — only ${file.name} was read.`);
+  beginImport(file);
+});
+window.addEventListener('resize', () => { if (!dropLayer.hidden) placeDropZone(); });
+window.addEventListener('scroll', () => { if (!dropLayer.hidden) placeDropZone(); }, true);
 
 // ---------- the shapes on this plate ----------
 // One entry per shape, at the canvas' top left. The one you pick is the one you draw on and the
@@ -1004,6 +1330,13 @@ function renderShapeList() {
   else listTimer = setTimeout(drawShapeList, 200);
 }
 
+// The overlap switch is the plate's own setting, so it only appears once there is a plate: two
+// shapes or more. It folds away behind the list header along with the shapes it belongs to.
+function syncOverlapRow() {
+  $('overlapBtn').setAttribute('aria-pressed', String(editor.allowOverlap));
+  $('shapesFoot').hidden = editor.layerCount < 2 || shapesList.hidden;
+}
+
 function drawShapeList() {
   const list = editor.layerList();
   const many = list.length > 1;
@@ -1015,18 +1348,16 @@ function drawShapeList() {
     row.setAttribute('role', 'option');
     row.setAttribute('aria-selected', String(l.active));
     row.dataset.index = String(l.index);
-    row.innerHTML = `<button type="button" class="shape-pick">${shapeThumb(l.outer, l.inner)}<span class="nm"></span></button>`
+    row.innerHTML = `<button type="button" class="shape-pick">${shapeThumb(l.outer, l.inner)}<span class="nm"></span>`
+      + '<span class="shape-flag" aria-hidden="true" hidden><i class="ph ph-arrow-counter-clockwise"></i></span></button>'
       + '<button type="button" class="btn ghost small icon shape-del"><i class="ph ph-trash"></i></button>';
     row.querySelector('.nm').textContent = l.drafting ? `${name} — unfinished` : l.empty ? `${name} — empty` : name;
-    const pick = row.querySelector('.shape-pick');
-    setTip(pick, l.active
-      ? `${name} — the shape you are working on. Its size, walls and connections are what the settings panel shows.`
-      : `${name} — switch to this shape. The one you are on now goes grey and cannot be moved until you come back.`);
     const del = row.querySelector('.shape-del');
     del.hidden = !many;
     setTip(del, `Delete ${name} — take this shape off the plate, settings and all. You can undo it.`);
     shapesList.append(row);
   }
+  syncShapeFlags(list);
   $('settingsScope').hidden = !many;
   $('settingsScopeName').textContent = `Shape ${editor.index + 1}`;
   // Another empty shape beside an empty one is nothing; finish this one first.
@@ -1035,6 +1366,31 @@ function drawShapeList() {
   setTip(add, add.disabled
     ? 'Add shape — draw this shape first. Every shape on the plate is a cutter of its own.'
     : 'Add shape — another cutter on the same plate, with its own size, walls and settings.');
+  syncOverlapRow();
+}
+
+// The same arrow the settings panel puts beside a number, one level up: this shape is not on the
+// standard settings. It is a marker and nothing else — the row it sits in switches shapes, and
+// putting the settings back is the panel's job, where you can see what you are changing. It has
+// to keep up with typing as well as with drawing, so it is updated from `onParamsChanged()` too
+// and does not redraw the rows (or their thumbnails) to do it.
+function syncShapeFlags(list = editor.layerList()) {
+  for (const row of shapesList.querySelectorAll('.shape-row')) {
+    const l = list[+row.dataset.index];
+    if (!l) continue;
+    const n = offDefaultCount(shapeCtx(editor.layers[l.index], l.inner));
+    if (row.dataset.off === String(n)) continue;
+    row.dataset.off = String(n);
+    row.querySelector('.shape-flag').hidden = n === 0;
+    const name = `Shape ${l.index + 1}`;
+    const off = n === 0 ? ''
+      : n === 1
+        ? ' One setting of it is not the standard one — the arrow says so, and the settings panel can put it back.'
+        : ` ${n} of its settings are not the standard ones — the arrow says so, and the settings panel can put them back.`;
+    setTip(row.querySelector('.shape-pick'), (l.active
+      ? `${name} — the shape you are working on. Its size, walls and connections are what the settings panel shows.`
+      : `${name} — switch to this shape. The one you are on now goes grey and cannot be moved until you come back.`) + off);
+  }
 }
 
 shapesList.addEventListener('click', (e) => {
@@ -1052,13 +1408,26 @@ $('addShapeBtn').addEventListener('click', () => {
   toast(`Shape ${editor.index + 1} added — draw it clear of the others. It keeps its own size, walls and settings.`);
 });
 
-// A file puts its shapes where it wants them, which may be closer together than a printer can
-// keep apart. Nothing is moved — the arrangement is the file's — but it is worth saying.
+// A file puts its shapes where it wants them, which may be on top of each other. Nothing is
+// moved — the arrangement is the file's — but what that means is worth saying: shapes that run
+// into each other come off the printer as one piece, so they are built as one object.
+function shapeNames(list) { return list.map(i => i + 1).join(', '); }
+
+// Did this file need the guard lowered? Read off the drawing, for the files that cannot say so
+// themselves: an SVG sheet whose charms touch, an STL of a plate that was modelled as one piece.
+let overlapAdopted = false;
+function adoptOverlapFromDrawing() {
+  overlapAdopted = !editor.allowOverlap && editor.clashingLayers().length > 0;
+  if (overlapAdopted) setOverlapAllowed(true);
+}
+
 function warnIfClashing() {
   const bad = editor.clashingLayers();
-  if (!bad.length) return;
-  const names = bad.map(i => i + 1).join(', ');
-  toast(`Shapes ${names} are touching or overlapping. Move them apart, or they will print as one piece.`);
+  if (!bad.length) { overlapAdopted = false; return; }
+  toast(overlapAdopted
+    ? `Shapes ${shapeNames(bad)} run into each other, so “Allow overlap” is on — they come out as one merged object.`
+    : `Shapes ${shapeNames(bad)} overlap — they come out as one merged object. Move them apart to print them separately.`);
+  overlapAdopted = false;
 }
 
 async function deleteShape(i) {
@@ -1079,6 +1448,7 @@ async function deleteShape(i) {
 function setShapesOpen(open) {
   $('shapesToggle').setAttribute('aria-expanded', String(open));
   shapesList.hidden = !open;
+  syncOverlapRow();
 }
 const narrowScreen = window.matchMedia('(max-width: 760px)');
 let shapesFoldedByHand = false;
@@ -1146,7 +1516,9 @@ $('ptDeleteBtn').addEventListener('click', () => editor.deletePoint());
 // edited — the box the move handles are drawn on.
 function updateShapeBar() {
   const bar = $('shapeBar');
-  const pos = editor.tool === 'move' ? editor.shapePos : null;
+  // Only while the tool is actually holding a shape — with nothing picked up there is no
+  // position to show and nothing the numbers would move.
+  const pos = editor.tool === 'move' && editor.picked ? editor.shapePos : null;
   if (!pos) { bar.hidden = true; return; }
   $('shapeBarLabel').textContent = editor.active === 'inner' ? 'Inner wall'
     : editor.layerCount > 1 ? `Shape ${editor.index + 1}` : 'Shape';
@@ -1244,6 +1616,28 @@ function setMirror(on) {
 }
 $('resultMirrorBtn').addEventListener('click', () => setMirror(!params.mirror));
 
+// Whether the shapes on this plate may run into each other. It belongs to the plate rather than
+// to any one shape, which is why it sits under the shapes list and not in the settings panel. It
+// governs the guard and nothing else: what the builder does with shapes that really do overlap is
+// decided by the shapes themselves, so a plate that came in overlapping stays one merged object
+// even with the guard back up.
+function setOverlapAllowed(on, { note = false } = {}) {
+  editor.allowOverlap = !!on;
+  syncOverlapRow();
+  if (!note) return;
+  const bad = editor.clashingLayers();
+  if (on) {
+    toast(bad.length
+      ? `Shapes may overlap now — shapes ${shapeNames(bad)} already do, and come out as one merged object.`
+      : 'Shapes may overlap now — where two of them run into each other they come out as one merged object.');
+  } else {
+    toast(bad.length
+      ? `Shapes ${shapeNames(bad)} still overlap — nothing is moved, so they stay one merged object until you move them apart.`
+      : 'Shapes stay apart again — a shape now stops against its neighbour.');
+  }
+}
+$('overlapBtn').addEventListener('click', () => setOverlapAllowed(!editor.allowOverlap, { note: true }));
+
 function syncResultMirror() {
   const row = $('resultMirror'), matters = mirrorMatters();
   row.hidden = !matters;
@@ -1291,6 +1685,31 @@ function shade(hex, amount) {
   return `rgb(${ch[0]}, ${ch[1]}, ${ch[2]})`;
 }
 
+// The contours to draw for the whole plate: the outlines to measure it by, and every ring the
+// even-odd fill needs. Where two shapes run into each other the clay comes away as one piece, so
+// their outlines are joined first and the holes cut out of the join — left as they are, even-odd
+// would punch the overlap out and draw a hole where the piece is thickest. With the shapes apart
+// the outlines as drawn are already the right answer, and nothing is handed to Clipper.
+function pieceRings(pieces) {
+  const outers = pieces.map(pc => pc.outer), holes = pieces.map(pc => pc.inner).filter(Boolean);
+  const plain = { outers, rings: outers.concat(holes) };
+  if (outers.length < 2) return plain;
+  const boxes = outers.map(bounds);
+  const apart = (a, b) => a.maxX < b.minX || b.maxX < a.minX || a.maxY < b.minY || b.maxY < a.minY;
+  let meet = false;
+  for (let a = 0; a < boxes.length && !meet; a++)
+    for (let b = a + 1; b < boxes.length && !meet; b++) meet = !apart(boxes[a], boxes[b]);
+  if (!meet) return plain;
+  try {
+    // Clipper fills by winding, so every outline has to run the same way round before it is joined.
+    const ccw = (pts) => (signedArea(pts) < 0 ? pts.slice().reverse() : pts);
+    const merged = unionPolygons(outers.map(ccw));
+    if (!merged.length) return plain;
+    const cut = holes.length ? subtractPolygons(merged, holes.map(ccw)) : merged;
+    return { outers: merged, rings: cut.length ? cut : merged };
+  } catch { return plain; }   // a picture of the piece is worth more than a perfect one
+}
+
 function renderResult() {
   if (!resultDlg.open) return;
   const cv = $('resultCanvas'), stage = cv.parentElement;
@@ -1314,7 +1733,8 @@ function renderResult() {
   // keeps the drawing the right way up, so what you see is the mirroring and nothing else.
   const face = (pts) => pts.map(p => ({ x: params.mirror ? p.x : -p.x, y: p.y }));
   const pieces = drawn.map(l => ({ outer: face(l.outer), inner: l.inner.length >= 3 ? face(l.inner) : null }));
-  const b = bounds(pieces.map(pc => pc.outer).flat());
+  const { outers, rings } = pieceRings(pieces);
+  const b = bounds(outers.flat());
   const scale = Math.min(w / Math.max(b.width, 0.001), h / Math.max(b.height, 0.001)) * 0.76;
   const depth = Math.max(4, Math.min(16, Math.min(w, h) * 0.04));   // apparent thickness of the slab
   const toPx = (p) => ({ x: w / 2 + (p.x - b.cx) * scale, y: h / 2 - depth / 2 + (p.y - b.cy) * scale });
@@ -1323,7 +1743,15 @@ function renderResult() {
     for (let i = 1; i < pts.length; i++) { const q = toPx(pts[i]); ctx.lineTo(q.x, q.y); }
     ctx.closePath();
   };
+  // What the clay is: one region per lump of it. Where two shapes run into each other that is
+  // their join, not two pieces lying on top of one another.
   const piece = () => {
+    ctx.beginPath();
+    for (const r of rings) path(r);
+  };
+  // Where it is cut. Every blade on the plate leaves an edge, the ones that run through the
+  // middle of a join included — that is where the clay comes apart into separate pieces.
+  const edges = () => {
     ctx.beginPath();
     for (const pc of pieces) { path(pc.outer); if (pc.inner) path(pc.inner); }
   };
@@ -1347,14 +1775,14 @@ function renderResult() {
   // A browser without canvas filters simply gets the unblurred band.
   ctx.filter = `blur(${(depth * 0.6).toFixed(1)}px)`;
   ctx.lineWidth = depth * 1.6; ctx.strokeStyle = 'rgba(0, 0, 0, 0.2)'; ctx.lineJoin = 'round';
-  piece(); ctx.stroke();
+  edges(); ctx.stroke();
   ctx.filter = 'none';
   const sheen = ctx.createRadialGradient(w * 0.34, h * 0.28, 0, w * 0.34, h * 0.28, Math.max(w, h) * 0.62);
   sheen.addColorStop(0, 'rgba(255, 255, 255, 0.16)'); sheen.addColorStop(1, 'rgba(255, 255, 255, 0)');
   ctx.fillStyle = sheen; ctx.fillRect(0, 0, w, h);
   ctx.restore();
 
-  piece(); ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0, 0, 0, 0.28)'; ctx.stroke();
+  edges(); ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0, 0, 0, 0.28)'; ctx.stroke();
 }
 
 setClayColor(clayColor);   // marks the swatch that is on; the canvas waits until the popup opens
@@ -1381,6 +1809,68 @@ function confirmAction(title, body, okLabel = 'Continue') {
   });
 }
 $('confirmCancelBtn').addEventListener('click', () => $('confirmDialog').close());
+
+// ---------- the import question ----------
+// A file arriving on a plate that already has something on it can mean two things, and only the
+// person who dropped it knows which: another cutter beside the ones there, or a fresh start.
+// Resolves 'add', 'replace', or null on Cancel and Esc. An empty canvas is not asked — there is
+// nothing to keep and nothing to replace.
+function askImportMode(file, count, title, body) {
+  if (!editor.hasAnyShape) return Promise.resolve('replace');
+  const dlg = $('importDialog');
+  $('importTitle').textContent = title;
+  $('importBody').textContent = body;
+  $('importAddLabel').textContent = count > 1 ? `Add ${count} shapes` : 'Add as a shape';
+  $('importReplaceLabel').textContent = 'Replace the drawing';
+  dlg.returnValue = '';
+  return new Promise((resolve) => {
+    const done = (v) => {
+      dlg.removeEventListener('submit', onSubmit);
+      dlg.removeEventListener('close', onClose);
+      resolve(v === 'add' || v === 'replace' ? v : null);
+    };
+    // The answer is the button that was pressed, read off the submit rather than off the close
+    // that follows it — the same way confirmAction() does, and for the same reason.
+    const onSubmit = (e) => done(e.submitter?.value || dlg.returnValue);
+    const onClose = () => done(dlg.returnValue);   // Esc, or a click on the backdrop
+    dlg.addEventListener('submit', onSubmit);
+    dlg.addEventListener('close', onClose);
+    if (!dlg.open) dlg.showModal();
+    $('importAddBtn').focus();
+  });
+}
+
+// ---------- the loader ----------
+// Reading a file and building the solid both happen on the main thread and both take long enough
+// on a big drawing to look like nothing is happening. The veil says otherwise — and it has to be
+// painted before the work starts, which is why putting it up is something you wait for.
+async function showLoader(text) {
+  $('loaderText').textContent = text;
+  $('loader').hidden = false;
+  // Two frames is one painted frame. A tab in the background is never painted and never gets a
+  // frame either, so the wait is raced against a timer — an import must not be able to hang on
+  // the user having looked at something else for a moment.
+  await new Promise(resolve => {
+    const done = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(done, 60);
+    requestAnimationFrame(() => requestAnimationFrame(done));
+  });
+}
+function hideLoader() { $('loader').hidden = true; }
+
+// Everything an import does, behind one veil. The 3D build that follows is part of the same wait,
+// so with `build` it is pulled out of its debounce and done here rather than after the veil has
+// come down and the app looks finished.
+async function withLoader(text, fn, { build = false } = {}) {
+  await showLoader(text);
+  try {
+    const out = await fn();
+    if (build) { clearTimeout(regenTimer); regenerate(); }
+    return out;
+  } finally {
+    hideLoader();
+  }
+}
 
 // ---------- toast ----------
 let toastTimer;

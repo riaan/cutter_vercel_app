@@ -10,7 +10,9 @@
 //
 // A project holds a list of shapes (layers), each with its own contours, mirror settings and
 // wall parameters. A schema-1 file held a single shape with the parameters alongside it; it is
-// read back as a plate with one shape on it.
+// read back as a plate with one shape on it. Shapes that overlap are one object in the STL, but
+// they are written here one by one all the same — opening the file gives the shapes back, not
+// the merged lump.
 
 import { DEFAULT_PARAMS } from './geometry.js';
 import { zipWrite, zipRead } from './zip.js';
@@ -59,6 +61,10 @@ export function serializeProject(state) {
     tool: ['draw', 'points', 'move'].includes(state.tool) ? state.tool : 'draw',
     smoothing: num(state.smoothing, 0.4),
     lockAspect: state.lockAspect !== false,
+    // Whether the shapes on this plate are allowed to run into each other. The shapes are always
+    // saved apart, one entry each, so a plate that prints as one merged object still opens as the
+    // separate shapes it was drawn from.
+    allowOverlap: !!state.allowOverlap,
     grid: { size: num(state.grid?.size, 10), snap: !!state.grid?.snap },
     // Only for the "does it still build the same" check on open — never fed back into geometry.
     stats: state.stats || null,
@@ -84,6 +90,9 @@ export function deserializeProject(data) {
     tool: ['draw', 'points', 'move'].includes(data.tool) ? data.tool : 'move',
     smoothing: num(data.smoothing, 0.4),
     lockAspect: data.lockAspect !== false,
+    // null where the file does not say — a file written before the setting existed may still
+    // hold shapes that overlap, and then the drawing is what has to decide.
+    allowOverlap: typeof data.allowOverlap === 'boolean' ? data.allowOverlap : null,
     grid: { size: num(data.grid?.size, 10), snap: !!data.grid?.snap },
     stats: data.stats || null,
     savedAt: data.savedAt || null,
